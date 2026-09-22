@@ -1,8 +1,6 @@
 /**
- * MEOWL TP - Discord Bot + API (version clés complète)
- * Commandes: clés, whitelist, admins, redeem, check, givekey, etc.
+ * LARP TP - Discord Bot + API
  */
-
 require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
@@ -28,47 +26,66 @@ const BOT_ADMINS = (process.env.BOT_ADMINS || "")
   .map((id) => id.trim())
   .filter(Boolean);
 
-const DATA_FILE = path.join(__dirname, "data.json");
+// Dossier writable (Render free)
+const DATA_DIR = process.env.DATA_DIR || "/tmp";
+const DATA_FILE = path.join(DATA_DIR, "larp-data.json");
+const LOCAL_FALLBACK = path.join(__dirname, "data.json");
 
 function loadData() {
-  try {
-    const d = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-    d.keys = d.keys || {};
-    d.invites = d.invites || {};
-    d.admins = d.admins || ["narutosde2p"];
-    d.whitelist = d.whitelist || {};
-    d.pausedWhitelist = d.pausedWhitelist || {};
-    d.lifetimeWhitelist = d.lifetimeWhitelist || {};
-    d.logs = d.logs || [];
-    return d;
-  } catch {
-    return {
-      admins: ["narutosde2p"],
-      whitelist: {},
-      pausedWhitelist: {},
-      lifetimeWhitelist: {},
-      keys: {},
-      invites: {},
-      logs: [],
-    };
+  for (const file of [DATA_FILE, LOCAL_FALLBACK]) {
+    try {
+      if (fs.existsSync(file)) {
+        const d = JSON.parse(fs.readFileSync(file, "utf8"));
+        d.keys = d.keys || {};
+        d.admins = d.admins || ["narutosde2p"];
+        d.whitelist = d.whitelist || {};
+        d.pausedWhitelist = d.pausedWhitelist || {};
+        d.lifetimeWhitelist = d.lifetimeWhitelist || {};
+        d.logs = d.logs || [];
+        return d;
+      }
+    } catch (e) {
+      console.warn("loadData", file, e.message);
+    }
   }
+  return {
+    admins: ["narutosde2p"],
+    whitelist: {},
+    pausedWhitelist: {},
+    lifetimeWhitelist: {},
+    keys: {},
+    logs: [],
+  };
 }
 
 function saveData(data) {
-  if (data.logs && data.logs.length > 150) data.logs = data.logs.slice(-150);
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+  try {
+    if (data.logs && data.logs.length > 150) data.logs = data.logs.slice(-150);
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.warn("saveData failed", e.message);
+    try {
+      fs.writeFileSync(LOCAL_FALLBACK, JSON.stringify(data, null, 2));
+    } catch (e2) {
+      console.warn("saveData fallback failed", e2.message);
+    }
+  }
 }
 
 function addLog(action, by, target, details) {
-  const data = loadData();
-  data.logs.push({
-    at: new Date().toISOString(),
-    action,
-    by,
-    target: target || "",
-    details: details || "",
-  });
-  saveData(data);
+  try {
+    const data = loadData();
+    data.logs.push({
+      at: new Date().toISOString(),
+      action,
+      by,
+      target: target || "",
+      details: details || "",
+    });
+    saveData(data);
+  } catch (e) {
+    console.warn("addLog", e.message);
+  }
 }
 
 function parseDuration(str) {
@@ -89,16 +106,6 @@ function parseDuration(str) {
   return { lifetime: false, seconds };
 }
 
-function formatTime(seconds) {
-  if (!seconds || seconds <= 0) return "0m";
-  const d = Math.floor(seconds / 86400);
-  const h = Math.floor((seconds % 86400) / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  if (d > 0) return d + "d " + h + "h";
-  if (h > 0) return h + "h " + m + "m";
-  return m + "m";
-}
-
 function isBotAdmin(userId) {
   return BOT_ADMINS.includes(String(userId));
 }
@@ -113,121 +120,103 @@ function applyAccess(data, username, parsed) {
   delete data.whitelist[key];
   delete data.pausedWhitelist[key];
   delete data.lifetimeWhitelist[key];
-  if (parsed.lifetime) {
-    data.lifetimeWhitelist[key] = true;
-  } else {
-    data.whitelist[key] = Math.floor(Date.now() / 1000) + parsed.seconds;
-  }
+  if (parsed.lifetime) data.lifetimeWhitelist[key] = true;
+  else data.whitelist[key] = Math.floor(Date.now() / 1000) + parsed.seconds;
 }
 
 const commands = [
   new SlashCommandBuilder()
     .setName("createkey")
-    .setDescription("Creer une cle MEOWL TP")
+    .setDescription("Creer une cle LARP TP")
     .addStringOption((o) =>
-      o.setName("duration").setDescription("30m / 1h / 1d / 1mo / lifetime").setRequired(true)
+      o.setName("duration").setDescription("30m / 1h / 1d / lifetime").setRequired(true)
     )
     .addIntegerOption((o) =>
       o.setName("amount").setDescription("Nombre de cles (1-20)").setMinValue(1).setMaxValue(20)
-    )
-    .addStringOption((o) => o.setName("note").setDescription("Note interne (optionnel)")),
+    ),
   new SlashCommandBuilder()
     .setName("givekey")
-    .setDescription("Creer une cle et l envoyer en MP")
-    .addUserOption((o) => o.setName("user").setDescription("Membre Discord").setRequired(true))
+    .setDescription("Creer une cle et lenvoyer en MP")
+    .addUserOption((o) => o.setName("user").setDescription("Membre").setRequired(true))
     .addStringOption((o) =>
       o.setName("duration").setDescription("30m / 1h / 1d / lifetime").setRequired(true)
     ),
   new SlashCommandBuilder()
     .setName("redeem")
-    .setDescription("Utiliser une cle pour obtenir l acces MEOWL TP")
+    .setDescription("Utiliser une cle")
+    .addStringOption((o) => o.setName("key").setDescription("Cle LARP-XXXX").setRequired(true))
     .addStringOption((o) =>
-      o.setName("key").setDescription("Ta cle (ex: MEOWL-XXXX-XXXX-XXXX)").setRequired(true)
-    )
-    .addStringOption((o) =>
-      o.setName("username").setDescription("Ton pseudo Roblox").setRequired(true)
+      o.setName("username").setDescription("Pseudo Roblox").setRequired(true)
     ),
   new SlashCommandBuilder()
     .setName("checkkey")
-    .setDescription("Verifier si une cle est valide / utilisee")
-    .addStringOption((o) => o.setName("key").setDescription("Cle a verifier").setRequired(true)),
-  new SlashCommandBuilder()
-    .setName("deletekey")
-    .setDescription("Supprimer une cle (admin)")
-    .addStringOption((o) => o.setName("key").setDescription("Cle a supprimer").setRequired(true)),
-  new SlashCommandBuilder().setName("listkeys").setDescription("Lister les cles recentes (admin)"),
+    .setDescription("Verifier une cle")
+    .addStringOption((o) => o.setName("key").setDescription("Cle").setRequired(true)),
   new SlashCommandBuilder()
     .setName("add")
-    .setDescription("Ajouter un joueur a la whitelist (sans cle)")
+    .setDescription("Whitelist sans cle")
     .addStringOption((o) => o.setName("username").setDescription("Pseudo Roblox").setRequired(true))
     .addStringOption((o) =>
-      o.setName("duration").setDescription("30m / 1h / 1d / lifetime").setRequired(true)
+      o.setName("duration").setDescription("1h / lifetime").setRequired(true)
     ),
   new SlashCommandBuilder()
     .setName("remove")
-    .setDescription("Retirer un joueur de la whitelist")
+    .setDescription("Retirer whitelist")
     .addStringOption((o) => o.setName("username").setDescription("Pseudo Roblox").setRequired(true)),
-  new SlashCommandBuilder()
-    .setName("addtime")
-    .setDescription("Ajouter du temps a un joueur")
-    .addStringOption((o) => o.setName("username").setDescription("Pseudo Roblox").setRequired(true))
-    .addStringOption((o) => o.setName("duration").setDescription("Ex: 1h").setRequired(true)),
   new SlashCommandBuilder()
     .setName("info")
-    .setDescription("Voir le statut d un joueur Roblox")
+    .setDescription("Info joueur")
     .addStringOption((o) => o.setName("username").setDescription("Pseudo Roblox").setRequired(true)),
-  new SlashCommandBuilder().setName("list").setDescription("Lister whitelist / admins / lifetime"),
-  new SlashCommandBuilder()
-    .setName("admin")
-    .setDescription("Ajouter ou retirer un admin Roblox")
-    .addStringOption((o) =>
-      o
-        .setName("action")
-        .setDescription("add ou remove")
-        .setRequired(true)
-        .addChoices({ name: "add", value: "add" }, { name: "remove", value: "remove" })
-    )
-    .addStringOption((o) => o.setName("username").setDescription("Pseudo Roblox").setRequired(true)),
-  new SlashCommandBuilder().setName("logs").setDescription("Voir les 15 derniers logs"),
-  new SlashCommandBuilder()
-    .setName("usertoid")
-    .setDescription("Aide pour trouver un UserId Roblox")
-    .addStringOption((o) => o.setName("username").setDescription("Pseudo Roblox").setRequired(true)),
+  new SlashCommandBuilder().setName("list").setDescription("Liste whitelist"),
 ].map((c) => c.toJSON());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
+client.once("clientReady", () => {
+  console.log("[BOT] Connecte:", client.user.tag);
+  console.log("[BOT] Admins Discord IDs:", BOT_ADMINS.join(", ") || "(aucun)");
+});
+// compat anciennes versions discord.js
 client.once("ready", () => {
-  console.log("[BOT] Connecte: " + client.user.tag);
+  console.log("[BOT] Connecte (ready):", client.user.tag);
+  console.log("[BOT] Admins Discord IDs:", BOT_ADMINS.join(", ") || "(aucun)");
 });
 
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   const cmd = interaction.commandName;
-  const publicCmds = ["redeem", "checkkey", "info", "usertoid"];
+  console.log("[CMD]", cmd, "by", interaction.user.id, interaction.user.tag);
+
+  // Repondre vite pour eviter "application ne repond plus"
+  try {
+    await interaction.deferReply({ ephemeral: true });
+  } catch (e) {
+    console.error("defer failed", e);
+    return;
+  }
+
+  const publicCmds = ["redeem", "checkkey", "info"];
   const needsAdmin = !publicCmds.includes(cmd);
 
   if (needsAdmin && !isBotAdmin(interaction.user.id)) {
-    return interaction.reply({
-      content: "Tu n as pas la permission d utiliser cette commande.",
-      ephemeral: true,
+    return interaction.editReply({
+      content:
+        "Permission refusee. Ton ID: `" +
+        interaction.user.id +
+        "` — ajoute-le dans BOT_ADMINS sur Render.",
     });
   }
 
-  const data = loadData();
-
   try {
+    const data = loadData();
+
     if (cmd === "createkey") {
       const durationStr = interaction.options.getString("duration");
       const amount = interaction.options.getInteger("amount") || 1;
-      const note = interaction.options.getString("note") || "";
       const parsed = parseDuration(durationStr);
       if (!parsed) {
-        return interaction.reply({
-          content: "Duree invalide. Ex: 30m, 1h, 1d, lifetime",
-          ephemeral: true,
-        });
+        return interaction.editReply({ content: "Duree invalide. Ex: 30m, 1h, 1d, lifetime" });
       }
       const created = [];
       for (let i = 0; i < amount; i++) {
@@ -236,29 +225,26 @@ client.on("interactionCreate", async (interaction) => {
           duration: durationStr,
           lifetime: parsed.lifetime,
           seconds: parsed.seconds,
+          durationSeconds: parsed.seconds,
           used: false,
           usedBy: null,
           usedAt: null,
           robloxUsername: null,
           createdBy: interaction.user.tag,
           createdAt: new Date().toISOString(),
-          note,
         };
         created.push(key);
       }
       saveData(data);
       addLog("createkey", interaction.user.tag, "", amount + "x " + durationStr);
-      const list = created.map((k) => "`" + k + "`").join("\n");
-      return interaction.reply({
+      return interaction.editReply({
         embeds: [
           new EmbedBuilder()
-            .setColor(0x7cdea7)
+            .setColor(0x00e5ff)
             .setTitle(amount + " cle(s) creee(s)")
-            .setDescription(list + "\n\nDuree: **" + durationStr + "**")
-            .setFooter({ text: note || "MEOWL TP" })
+            .setDescription(created.map((k) => "`" + k + "`").join("\n") + "\n\nDuree: **" + durationStr + "**")
             .setTimestamp(),
         ],
-        ephemeral: true,
       });
     }
 
@@ -266,55 +252,39 @@ client.on("interactionCreate", async (interaction) => {
       const user = interaction.options.getUser("user");
       const durationStr = interaction.options.getString("duration");
       const parsed = parseDuration(durationStr);
-      if (!parsed) {
-        return interaction.reply({ content: "Duree invalide.", ephemeral: true });
-      }
+      if (!parsed) return interaction.editReply({ content: "Duree invalide." });
       const key = generateKey();
       data.keys[key] = {
         duration: durationStr,
         lifetime: parsed.lifetime,
         seconds: parsed.seconds,
+        durationSeconds: parsed.seconds,
         used: false,
         usedBy: null,
-        usedAt: null,
-        robloxUsername: null,
         createdBy: interaction.user.tag,
         createdAt: new Date().toISOString(),
-        note: "DM to " + user.tag,
+        note: "DM " + user.tag,
       };
       saveData(data);
-      addLog("givekey", interaction.user.tag, user.tag, durationStr);
       try {
         await user.send({
           embeds: [
             new EmbedBuilder()
-              .setColor(0xf8f6f2)
-              .setTitle("Ta cle MEOWL TP")
+              .setColor(0x00e5ff)
+              .setTitle("Cle LARP TP")
               .setDescription(
-                "Voici ta cle :\n\n`" +
+                "`" +
                   key +
-                  "`\n\n**Duree:** " +
+                  "`\nDuree: **" +
                   durationStr +
-                  "\n\nPour l activer:\n`/redeem key:" +
-                  key +
-                  " username:TonPseudoRoblox`"
-              )
-              .setTimestamp(),
+                  "**\n\nEn jeu: My Key → Redeem\nOu `/redeem`"
+              ),
           ],
         });
-        return interaction.reply({
-          content: "Cle envoyee en MP a **" + user.tag + "**.",
-          ephemeral: true,
-        });
+        return interaction.editReply({ content: "Cle envoyee en MP a **" + user.tag + "**." });
       } catch {
-        return interaction.reply({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0xca8b58)
-              .setTitle("MP impossible")
-              .setDescription("Impossible d envoyer un MP.\nCle:\n`" + key + "`"),
-          ],
-          ephemeral: true,
+        return interaction.editReply({
+          content: "MP impossible. Cle: `" + key + "`",
         });
       }
     }
@@ -323,168 +293,61 @@ client.on("interactionCreate", async (interaction) => {
       const keyInput = interaction.options.getString("key").trim().toUpperCase();
       const username = interaction.options.getString("username").trim();
       const keyData = data.keys[keyInput];
-
       if (!keyData) {
-        return interaction.reply({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0xee6767)
-              .setTitle("Cle invalide")
-              .setDescription("Cette cle n existe pas. Verifie que tu l as bien copiee."),
-          ],
-          ephemeral: true,
-        });
+        return interaction.editReply({ content: "Cle invalide." });
       }
-
       if (keyData.used) {
-        return interaction.reply({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0xee6767)
-              .setTitle("Cle deja utilisee")
-              .setDescription(
-                "Cette cle a deja ete utilisee" +
-                  (keyData.robloxUsername ? " par **" + keyData.robloxUsername + "**." : ".")
-              ),
-          ],
-          ephemeral: true,
+        return interaction.editReply({
+          content: "Cle deja utilisee" + (keyData.robloxUsername ? " par **" + keyData.robloxUsername + "**." : "."),
         });
       }
-
+      const uname = username.toLowerCase();
+      // pas de cumul
+      if (data.lifetimeWhitelist[uname]) {
+        return interaction.editReply({ content: "Ce compte a deja lifetime. Pas de cumul." });
+      }
+      const now = Math.floor(Date.now() / 1000);
+      if (data.whitelist[uname] && data.whitelist[uname] > now) {
+        return interaction.editReply({ content: "Ce compte a deja du temps. Pas de cumul." });
+      }
       applyAccess(data, username, {
         lifetime: keyData.lifetime,
-        seconds: keyData.seconds,
+        seconds: keyData.seconds || keyData.durationSeconds || 3600,
       });
       keyData.used = true;
       keyData.usedBy = interaction.user.tag;
       keyData.usedAt = new Date().toISOString();
-      keyData.robloxUsername = username.toLowerCase();
+      keyData.robloxUsername = uname;
       saveData(data);
-      addLog("redeem", interaction.user.tag, username, keyInput);
-
-      const durText = keyData.lifetime ? "LIFETIME" : keyData.duration;
-      return interaction.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0x7cdea7)
-            .setTitle("Cle acceptee")
-            .setDescription(
-              "Acces **" +
-                durText +
-                "** ajoute pour **" +
-                username +
-                "**.\n\nTu peux rejoindre le jeu et ouvrir le panel (touche **C**)."
-            )
-            .setTimestamp(),
-        ],
-        ephemeral: true,
+      return interaction.editReply({
+        content:
+          "Cle acceptee pour **" +
+          username +
+          "** — " +
+          (keyData.lifetime ? "LIFETIME" : keyData.duration),
       });
     }
 
     if (cmd === "checkkey") {
       const keyInput = interaction.options.getString("key").trim().toUpperCase();
       const keyData = data.keys[keyInput];
-      if (!keyData) {
-        return interaction.reply({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0xee6767)
-              .setTitle("Cle introuvable")
-              .setDescription("Cette cle n existe pas dans la base."),
-          ],
-          ephemeral: true,
-        });
-      }
+      if (!keyData) return interaction.editReply({ content: "Cle introuvable." });
       if (keyData.used) {
-        return interaction.reply({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0xca8b58)
-              .setTitle("Cle deja utilisee")
-              .addFields(
-                { name: "Duree", value: keyData.duration, inline: true },
-                {
-                  name: "Utilisee par",
-                  value: keyData.robloxUsername || keyData.usedBy || "?",
-                  inline: true,
-                },
-                {
-                  name: "Date",
-                  value: keyData.usedAt ? keyData.usedAt.slice(0, 19) : "?",
-                  inline: true,
-                }
-              ),
-          ],
-          ephemeral: true,
+        return interaction.editReply({
+          content: "Deja utilisee — " + (keyData.robloxUsername || keyData.usedBy || "?"),
         });
       }
-      return interaction.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0x7cdea7)
-            .setTitle("Cle valide (non utilisee)")
-            .addFields(
-              { name: "Duree", value: keyData.duration, inline: true },
-              { name: "Creee par", value: keyData.createdBy || "?", inline: true }
-            ),
-        ],
-        ephemeral: true,
-      });
-    }
-
-    if (cmd === "deletekey") {
-      const keyInput = interaction.options.getString("key").trim().toUpperCase();
-      if (!data.keys[keyInput]) {
-        return interaction.reply({ content: "Cle introuvable.", ephemeral: true });
-      }
-      delete data.keys[keyInput];
-      saveData(data);
-      addLog("deletekey", interaction.user.tag, keyInput, "");
-      return interaction.reply({
-        content: "Cle `" + keyInput + "` supprimee.",
-        ephemeral: true,
-      });
-    }
-
-    if (cmd === "listkeys") {
-      const entries = Object.entries(data.keys).slice(-20).reverse();
-      if (!entries.length) {
-        return interaction.reply({ content: "Aucune cle.", ephemeral: true });
-      }
-      const lines = entries.map(([k, v]) => {
-        const status = v.used ? "used (" + (v.robloxUsername || "?") + ")" : "free";
-        return "`" + k + "` — " + v.duration + " — " + status;
-      });
-      return interaction.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xf8f6f2)
-            .setTitle("Dernieres cles")
-            .setDescription(lines.join("\n"))
-            .setTimestamp(),
-        ],
-        ephemeral: true,
-      });
+      return interaction.editReply({ content: "Valide — duree **" + keyData.duration + "**" });
     }
 
     if (cmd === "add") {
       const username = interaction.options.getString("username").toLowerCase();
       const durationStr = interaction.options.getString("duration");
       const parsed = parseDuration(durationStr);
-      if (!parsed) {
-        return interaction.reply({ content: "Duree invalide.", ephemeral: true });
-      }
+      if (!parsed) return interaction.editReply({ content: "Duree invalide." });
       applyAccess(data, username, parsed);
       saveData(data);
-      addLog("add", interaction.user.tag, username, durationStr);
-      return interaction.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0x7cdea7)
-            .setTitle("Whitelist")
-            .setDescription("**" + username + "** → **" + durationStr + "**"),
-        ],
-      });
+      return interaction.editReply({ content: "**" + username + "** → **" + durationStr + "**" });
     }
 
     if (cmd === "remove") {
@@ -493,140 +356,38 @@ client.on("interactionCreate", async (interaction) => {
       delete data.pausedWhitelist[username];
       delete data.lifetimeWhitelist[username];
       saveData(data);
-      addLog("remove", interaction.user.tag, username, "");
-      return interaction.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xee6767)
-            .setTitle("Retire")
-            .setDescription("**" + username + "** retire de la whitelist."),
-        ],
-      });
-    }
-
-    if (cmd === "addtime") {
-      const username = interaction.options.getString("username").toLowerCase();
-      const durationStr = interaction.options.getString("duration");
-      const parsed = parseDuration(durationStr);
-      if (!parsed || parsed.lifetime) {
-        return interaction.reply({ content: "Utilise une duree (ex: 1h).", ephemeral: true });
-      }
-      if (data.lifetimeWhitelist[username]) {
-        return interaction.reply({ content: "Deja lifetime.", ephemeral: true });
-      }
-      const now = Math.floor(Date.now() / 1000);
-      if (data.pausedWhitelist[username]) {
-        data.pausedWhitelist[username].remaining =
-          (data.pausedWhitelist[username].remaining || 0) + parsed.seconds;
-      } else {
-        const current = data.whitelist[username] || now;
-        data.whitelist[username] = Math.max(current, now) + parsed.seconds;
-      }
-      saveData(data);
-      addLog("addtime", interaction.user.tag, username, "+" + durationStr);
-      return interaction.reply({
-        content: "**+" + durationStr + "** pour **" + username + "**",
-      });
+      return interaction.editReply({ content: "**" + username + "** retire." });
     }
 
     if (cmd === "info") {
       const username = interaction.options.getString("username").toLowerCase();
       const now = Math.floor(Date.now() / 1000);
       let status = "Aucun acces";
-      let color = 0xee6767;
-      if (data.admins.includes(username)) {
-        status = "**ADMIN**";
-        color = 0xf8f6f2;
-      } else if (data.lifetimeWhitelist[username]) {
-        status = "**LIFETIME**";
-        color = 0x7cdea7;
-      } else if (data.pausedWhitelist[username]) {
-        status = "**PAUSED** — " + formatTime(data.pausedWhitelist[username].remaining || 0);
-        color = 0xca8b58;
-      } else if (data.whitelist[username] && data.whitelist[username] > now) {
-        status = "**WHITELIST** — " + formatTime(data.whitelist[username] - now);
-        color = 0x7cdea7;
-      }
-      return interaction.reply({
-        embeds: [
-          new EmbedBuilder().setColor(color).setTitle("Info — " + username).setDescription(status),
-        ],
-        ephemeral: true,
-      });
+      if (data.admins.includes(username)) status = "ADMIN";
+      else if (data.lifetimeWhitelist[username]) status = "LIFETIME";
+      else if (data.whitelist[username] && data.whitelist[username] > now)
+        status = "WHITELIST (" + Math.floor((data.whitelist[username] - now) / 60) + "m)";
+      return interaction.editReply({ content: "**" + username + "** — " + status });
     }
 
     if (cmd === "list") {
       const now = Math.floor(Date.now() / 1000);
-      const admins = data.admins.join(", ") || "aucun";
-      const lifetime = Object.keys(data.lifetimeWhitelist).join(", ") || "aucun";
+      const life = Object.keys(data.lifetimeWhitelist).join(", ") || "aucun";
       const active = [];
-      for (const [name, expiry] of Object.entries(data.whitelist)) {
-        if (expiry > now) active.push(name + " (" + formatTime(expiry - now) + ")");
+      for (const [n, exp] of Object.entries(data.whitelist)) {
+        if (exp > now) active.push(n);
       }
-      return interaction.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xf8f6f2)
-            .setTitle("MEOWL TP")
-            .addFields(
-              { name: "Admins", value: admins },
-              { name: "Lifetime", value: lifetime },
-              { name: "Whitelist active", value: active.length ? active.join("\n") : "aucun" }
-            ),
-        ],
-        ephemeral: true,
+      return interaction.editReply({
+        content: "Lifetime: " + life + "\nActifs: " + (active.join(", ") || "aucun"),
       });
     }
 
-    if (cmd === "admin") {
-      const action = interaction.options.getString("action");
-      const username = interaction.options.getString("username").toLowerCase();
-      if (action === "add") {
-        if (!data.admins.includes(username)) data.admins.push(username);
-        saveData(data);
-        addLog("admin_add", interaction.user.tag, username, "");
-        return interaction.reply({ content: "**" + username + "** est admin." });
-      }
-      if (username === "narutosde2p") {
-        return interaction.reply({
-          content: "Impossible de retirer le owner.",
-          ephemeral: true,
-        });
-      }
-      data.admins = data.admins.filter((a) => a !== username);
-      saveData(data);
-      addLog("admin_remove", interaction.user.tag, username, "");
-      return interaction.reply({ content: "**" + username + "** n est plus admin." });
-    }
-
-    if (cmd === "logs") {
-      const recent = (data.logs || []).slice(-15).reverse();
-      if (!recent.length) return interaction.reply({ content: "Aucun log.", ephemeral: true });
-      const text = recent
-        .map((l) => "`" + l.at.slice(0, 16) + "` **" + l.action + "** " + l.target + " " + l.details)
-        .join("\n");
-      return interaction.reply({
-        embeds: [new EmbedBuilder().setColor(0xf8f6f2).setTitle("Logs").setDescription(text)],
-        ephemeral: true,
-      });
-    }
-
-    if (cmd === "usertoid") {
-      const username = interaction.options.getString("username");
-      return interaction.reply({
-        content:
-          "Pour **" +
-          username +
-          "**, regarde l URL du profil Roblox:\nhttps://www.roblox.com/search/users?keyword=" +
-          encodeURIComponent(username),
-        ephemeral: true,
-      });
-    }
+    return interaction.editReply({ content: "Commande inconnue." });
   } catch (err) {
-    console.error(err);
-    if (!interaction.replied) {
-      interaction.reply({ content: "Erreur serveur.", ephemeral: true }).catch(() => {});
-    }
+    console.error("[ERR]", cmd, err);
+    try {
+      await interaction.editReply({ content: "Erreur: " + (err.message || "server") });
+    } catch (_) {}
   }
 });
 
@@ -662,37 +423,6 @@ app.get("/api/data", checkSecret, (req, res) => {
   });
 });
 
-app.post("/api/pause", checkSecret, (req, res) => {
-  const body = req.body || {};
-  const username = body.username;
-  const remaining = body.remaining;
-  if (!username) return res.status(400).json({ ok: false });
-  const data = loadData();
-  const key = String(username).toLowerCase();
-  delete data.whitelist[key];
-  data.pausedWhitelist[key] = {
-    remaining: Number(remaining) || 0,
-    expiry: Math.floor(Date.now() / 1000) + (Number(remaining) || 0),
-  };
-  saveData(data);
-  res.json({ ok: true });
-});
-
-app.post("/api/resume", checkSecret, (req, res) => {
-  const body = req.body || {};
-  const username = body.username;
-  const remaining = body.remaining;
-  if (!username) return res.status(400).json({ ok: false });
-  const data = loadData();
-  const key = String(username).toLowerCase();
-  delete data.pausedWhitelist[key];
-  data.whitelist[key] = Math.floor(Date.now() / 1000) + (Number(remaining) || 0);
-  saveData(data);
-  res.json({ ok: true });
-});
-
-
-// ===== KEYS API for Roblox =====
 app.get("/api/keys", checkSecret, (req, res) => {
   const data = loadData();
   res.json({ ok: true, keys: data.keys || {} });
@@ -703,23 +433,19 @@ app.post("/api/keys/use", checkSecret, (req, res) => {
   const key = String(body.key || "").toUpperCase().replace(/\s+/g, "");
   const username = String(body.username || "").toLowerCase();
   const data = loadData();
-  if (!data.keys[key]) {
-    return res.json({ ok: false, error: "unknown key" });
-  }
+  if (!data.keys[key]) return res.json({ ok: false, error: "unknown" });
   data.keys[key].used = true;
-  data.keys[key].usedBy = username || data.keys[key].usedBy;
-  data.keys[key].usedAt = new Date().toISOString();
+  data.keys[key].usedBy = username;
   data.keys[key].robloxUsername = username;
+  data.keys[key].usedAt = new Date().toISOString();
   saveData(data);
-  addLog("redeem_roblox", "roblox", username, key);
   res.json({ ok: true });
 });
 
 app.get("/", (req, res) => res.send("LARP TP API running."));
 
-
 if (!DISCORD_TOKEN || !CLIENT_ID || !GUILD_ID) {
-  console.error("Configure DISCORD_TOKEN, CLIENT_ID, GUILD_ID dans .env");
+  console.error("Configure DISCORD_TOKEN, CLIENT_ID, GUILD_ID");
   process.exit(1);
 }
 
@@ -727,6 +453,4 @@ registerCommands()
   .then(() => client.login(DISCORD_TOKEN))
   .catch((e) => console.error(e));
 
-app.listen(PORT, () => {
-  console.log("[API] Port " + PORT);
-});
+app.listen(PORT, () => console.log("[API] Port", PORT));
