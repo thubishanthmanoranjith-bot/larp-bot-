@@ -1,5 +1,6 @@
 /**
  * LARP TP - Discord Bot + API
+ * + système d'invites (conversion clés / spins) + panel permanent
  */
 require("dotenv").config();
 const fs = require("fs");
@@ -10,10 +11,14 @@ const cors = require("cors");
 const {
   Client,
   GatewayIntentBits,
+  Partials,
   EmbedBuilder,
   SlashCommandBuilder,
   REST,
   Routes,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } = require("discord.js");
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -32,6 +37,12 @@ const LOCAL_FALLBACK = path.join(__dirname, "data.json");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+// Coûts invites
+const INVITE_COST_1H = 1; // 1 invite → clé 1h
+const INVITE_COST_SPINS = 1; // 1 invite → 2 spins
+const INVITE_COST_1D = 5; // 5 invites → clé 1d
+const SPINS_REWARD = 2;
+
 // ─── Couleurs dice ─────────────────────────────────────────
 const DICE_COLORS = [
   { name: "Red", emoji: "🔴", value: "Red", color: 0xe74c3c },
@@ -41,6 +52,9 @@ const DICE_COLORS = [
   { name: "Orange", emoji: "🟠", value: "Orange", color: 0xe67e22 },
   { name: "Violet", emoji: "🟣", value: "Violet", color: 0x9b59b6 },
 ];
+
+// Cache invites Discord (code → uses)
+const invitesCache = new Map();
 
 function loadData() {
   for (const file of [DATA_FILE, LOCAL_FALLBACK]) {
@@ -59,6 +73,9 @@ function loadData() {
         d.diceBonus = d.diceBonus || {};
         d.globalSpinBonus = d.globalSpinBonus || 0;
         d.globalDiceBonus = d.globalDiceBonus || 0;
+        d.invites = d.invites || {}; // userId → points disponibles
+        d.invitesUsed = d.invitesUsed || {}; // userId → total déjà dépensé
+        d.invitedUsers = d.invitedUsers || {}; // invitedUserId → inviterId (anti multi-compte simple)
         return d;
       }
     } catch (e) {
@@ -78,6 +95,9 @@ function loadData() {
     diceBonus: {},
     globalSpinBonus: 0,
     globalDiceBonus: 0,
+    invites: {},
+    invitesUsed: {},
+    invitedUsers: {},
   };
 }
 
@@ -155,21 +175,25 @@ function timeLeft(ms) {
   return `~**${m}m**`;
 }
 
-function makeKey1h(source) {
+function makeKey(durationStr, seconds, source) {
   const key = generateKey();
   return {
     key,
     data: {
-      duration: "1h",
+      duration: durationStr,
       lifetime: false,
-      seconds: 3600,
-      durationSeconds: 3600,
+      seconds,
+      durationSeconds: seconds,
       used: false,
       usedBy: null,
       createdBy: source,
       createdAt: new Date().toISOString(),
     },
   };
+}
+
+function makeKey1h(source) {
+  return makeKey("1h", 3600, source);
 }
 
 function getBonus(data, type, uid) {
@@ -195,9 +219,23 @@ function consumeBonus(data, type, uid) {
   }
 }
 
-// Animation visuelle pour le spin
+function getInvitePoints(data, uid) {
+  return data.invites[uid] || 0;
+}
+
+function addInvitePoints(data, uid, amount) {
+  data.invites[uid] = (data.invites[uid] || 0) + amount;
+}
+
+function spendInvitePoints(data, uid, amount) {
+  const cur = data.invites[uid] || 0;
+  if (cur < amount) return false;
+  data.invites[uid] = cur - amount;
+  data.invitesUsed[uid] = (data.invitesUsed[uid] || 0) + amount;
+  return true;
+}
+
 function spinVisual(roll, win) {
-  const bars = ["▱", "▰"];
   const fill = Math.min(10, Math.floor(roll / 10));
   const bar = "▰".repeat(fill) + "▱".repeat(10 - fill);
   return (
@@ -216,7 +254,6 @@ function spinVisual(roll, win) {
   );
 }
 
-// Animation visuelle pour le dice (4 couleurs tirées)
 function diceVisual(pickEmoji, pick, rolledEmojis, match) {
   const line = rolledEmojis.join("  ");
   return (
@@ -239,6 +276,48 @@ function diceVisual(pickEmoji, pick, rolledEmojis, match) {
     (match
       ? "🎉🎊 **TA COULEUR EST SORTIE !** Tu gagnes une clé **1h** 🔑"
       : "💔 Ta couleur n'est pas sortie... retente demain !")
+  );
+}
+
+function buildInvitePanelEmbed() {
+  return new EmbedBuilder()
+    .setColor(0x9b59b6)
+    .setTitle("🎟️ Panel Invites — LARP TP")
+    .setDescription(
+      "Invite des potes sur le serveur et **échange tes invites** contre des récompenses !\n\n" +
+        "**Taux d'échange :**\n" +
+        "• `1` invite → 🔑 clé **1h**\n" +
+        "• `1` invite → 🎰 **2 spins**\n" +
+        "• `5` invites → 🔑 clé **1 jour**\n\n" +
+        "⚠️ Chaque invite ne peut être **dépensée qu'une seule fois**.\n" +
+        "Clique sur un bouton ci-dessous pour échanger."
+    )
+    .setFooter({ text: "LARP TP • Invites" })
+    .setTimestamp();
+}
+
+function buildInvitePanelButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("inv_claim_1h")
+      .setLabel("1 invite → Clé 1h")
+      .setEmoji("🔑")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId("inv_claim_spins")
+      .setLabel("1 invite → 2 Spins")
+      .setEmoji("🎰")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId("inv_claim_1d")
+      .setLabel("5 invites → Clé 1j")
+      .setEmoji("💎")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("inv_check")
+      .setLabel("Mes invites")
+      .setEmoji("📊")
+      .setStyle(ButtonStyle.Secondary)
   );
 }
 
@@ -350,20 +429,301 @@ const commands = [
     .addIntegerOption((o) =>
       o.setName("amount").setDescription("Nombre (défaut 1)").setMinValue(1).setMaxValue(20)
     ),
+  // ─── INVITES ─────────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setName("invites")
+    .setDescription("🎟️ Voir tes points d'invites"),
+  new SlashCommandBuilder()
+    .setName("invitepanel")
+    .setDescription("📌 Poster le panel d'invites (reste dans le salon)"),
+  new SlashCommandBuilder()
+    .setName("addinvites")
+    .setDescription("➕ Ajouter des points d'invites à un user (admin)")
+    .addUserOption((o) => o.setName("user").setDescription("Membre").setRequired(true))
+    .addIntegerOption((o) =>
+      o.setName("amount").setDescription("Nombre de points").setRequired(true).setMinValue(1).setMaxValue(100)
+    ),
+  new SlashCommandBuilder()
+    .setName("setinvites")
+    .setDescription("✏️ Définir les points d'invites d'un user (admin)")
+    .addUserOption((o) => o.setName("user").setDescription("Membre").setRequired(true))
+    .addIntegerOption((o) =>
+      o.setName("amount").setDescription("Nouveau total").setRequired(true).setMinValue(0).setMaxValue(999)
+    ),
 ].map((c) => c.toJSON());
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildInvites,
+  ],
+  partials: [Partials.GuildMember],
+});
 
-client.once("clientReady", () => {
+async function cacheGuildInvites(guild) {
+  try {
+    const invites = await guild.invites.fetch();
+    const map = new Map();
+    invites.forEach((inv) => map.set(inv.code, inv.uses || 0));
+    invitesCache.set(guild.id, map);
+    console.log("[INVITES] Cache chargé:", map.size, "invites pour", guild.name);
+  } catch (e) {
+    console.warn("[INVITES] Impossible de charger les invites:", e.message);
+  }
+}
+
+client.once("clientReady", async () => {
   console.log("[BOT] Connecté:", client.user.tag);
   console.log("[BOT] Admins Discord IDs:", BOT_ADMINS.join(", ") || "(aucun)");
+  for (const [, guild] of client.guilds.cache) {
+    await cacheGuildInvites(guild);
+  }
 });
-client.once("ready", () => {
+client.once("ready", async () => {
   console.log("[BOT] Connecté (ready):", client.user.tag);
   console.log("[BOT] Admins Discord IDs:", BOT_ADMINS.join(", ") || "(aucun)");
+  for (const [, guild] of client.guilds.cache) {
+    await cacheGuildInvites(guild);
+  }
+});
+
+// Quand quelqu'un rejoint → détecter qui a invité
+client.on("guildMemberAdd", async (member) => {
+  try {
+    const cached = invitesCache.get(member.guild.id) || new Map();
+    let usedInvite = null;
+    try {
+      const newInvites = await member.guild.invites.fetch();
+      for (const [code, inv] of newInvites) {
+        const prev = cached.get(code) || 0;
+        if ((inv.uses || 0) > prev) {
+          usedInvite = inv;
+          break;
+        }
+      }
+      // maj cache
+      const map = new Map();
+      newInvites.forEach((inv) => map.set(inv.code, inv.uses || 0));
+      invitesCache.set(member.guild.id, map);
+    } catch (e) {
+      console.warn("[INVITES] fetch after join:", e.message);
+      return;
+    }
+
+    if (!usedInvite || !usedInvite.inviter) return;
+
+    const inviterId = usedInvite.inviter.id;
+    if (inviterId === member.id) return; // self-invite
+
+    const data = loadData();
+    data.invitedUsers = data.invitedUsers || {};
+    data.invites = data.invites || {};
+
+    // Déjà compté pour ce membre → ignore (anti double)
+    if (data.invitedUsers[member.id]) {
+      console.log("[INVITES] Déjà compté pour", member.user.tag);
+      return;
+    }
+
+    data.invitedUsers[member.id] = inviterId;
+    addInvitePoints(data, inviterId, 1);
+    saveData(data);
+    addLog("invite", usedInvite.inviter.tag, member.user.tag, "+1");
+
+    console.log(
+      "[INVITES] +1 pour",
+      usedInvite.inviter.tag,
+      "(a invité",
+      member.user.tag + ")"
+    );
+
+    // MP optionnel à l'inviteur
+    try {
+      await usedInvite.inviter.send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x9b59b6)
+            .setTitle("🎟️ +1 Invite !")
+            .setDescription(
+              "**" +
+                member.user.tag +
+                "** a rejoint grâce à ton lien.\n" +
+                "Tu as maintenant **" +
+                getInvitePoints(data, inviterId) +
+                "** point(s).\n\n" +
+                "Échange-les via le **panel invites** du serveur."
+            )
+            .setTimestamp(),
+        ],
+      });
+    } catch (_) {}
+  } catch (err) {
+    console.error("[INVITES] guildMemberAdd", err);
+  }
+});
+
+// Quand une invite est créée → maj cache
+client.on("inviteCreate", async (invite) => {
+  try {
+    const map = invitesCache.get(invite.guild.id) || new Map();
+    map.set(invite.code, invite.uses || 0);
+    invitesCache.set(invite.guild.id, map);
+  } catch (_) {}
+});
+
+client.on("inviteDelete", async (invite) => {
+  try {
+    const map = invitesCache.get(invite.guild.id);
+    if (map) map.delete(invite.code);
+  } catch (_) {}
 });
 
 client.on("interactionCreate", async (interaction) => {
+  // ─── BOUTONS PANEL INVITES ─────────────────────────────
+  if (interaction.isButton()) {
+    const id = interaction.customId;
+    if (!id.startsWith("inv_")) return;
+
+    try {
+      await interaction.deferReply({ ephemeral: true });
+    } catch (e) {
+      return;
+    }
+
+    const uid = interaction.user.id;
+    const data = loadData();
+    data.invites = data.invites || {};
+    data.invitesUsed = data.invitesUsed || {};
+    data.spinsBonus = data.spinsBonus || {};
+    data.keys = data.keys || {};
+
+    if (id === "inv_check") {
+      const pts = getInvitePoints(data, uid);
+      const used = data.invitesUsed[uid] || 0;
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x9b59b6)
+            .setTitle("📊 Tes invites")
+            .setDescription(
+              "🎟️ Points disponibles: **" +
+                pts +
+                "**\n" +
+                "✅ Déjà dépensés: **" +
+                used +
+                "**\n\n" +
+                "**Échanges :**\n" +
+                "• 1 → clé 1h\n" +
+                "• 1 → 2 spins\n" +
+                "• 5 → clé 1 jour"
+            )
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    if (id === "inv_claim_1h") {
+      if (!spendInvitePoints(data, uid, INVITE_COST_1H)) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Pas assez d'invites")
+              .setDescription(
+                "Il te faut **1** invite.\nTu as: **" + getInvitePoints(data, uid) + "**"
+              ),
+          ],
+        });
+      }
+      const { key, data: kData } = makeKey1h("invite");
+      data.keys[key] = kData;
+      saveData(data);
+      addLog("inv_claim_1h", interaction.user.tag, "", key);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("✅ Clé 1h obtenue !")
+            .setDescription(
+              "🎟️ -1 invite\n\n🔑 `" +
+                key +
+                "`\n\nUtilise `/redeem` ou **My Key** en jeu."
+            )
+            .setFooter({ text: "Restant: " + getInvitePoints(data, uid) + " invite(s)" })
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    if (id === "inv_claim_spins") {
+      if (!spendInvitePoints(data, uid, INVITE_COST_SPINS)) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Pas assez d'invites")
+              .setDescription(
+                "Il te faut **1** invite.\nTu as: **" + getInvitePoints(data, uid) + "**"
+              ),
+          ],
+        });
+      }
+      data.spinsBonus[uid] = (data.spinsBonus[uid] || 0) + SPINS_REWARD;
+      delete data.spins[uid]; // reset cooldown pour pouvoir spin tout de suite
+      saveData(data);
+      addLog("inv_claim_spins", interaction.user.tag, "", String(SPINS_REWARD));
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("✅ 2 Spins obtenus !")
+            .setDescription(
+              "🎟️ -1 invite\n\n🎰 Tu as reçu **2 spins** bonus.\nUtilise `/spin` maintenant !"
+            )
+            .setFooter({ text: "Restant: " + getInvitePoints(data, uid) + " invite(s)" })
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    if (id === "inv_claim_1d") {
+      if (!spendInvitePoints(data, uid, INVITE_COST_1D)) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Pas assez d'invites")
+              .setDescription(
+                "Il te faut **5** invites.\nTu as: **" + getInvitePoints(data, uid) + "**"
+              ),
+          ],
+        });
+      }
+      const { key, data: kData } = makeKey("1d", 86400, "invite");
+      data.keys[key] = kData;
+      saveData(data);
+      addLog("inv_claim_1d", interaction.user.tag, "", key);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("✅ Clé 1 jour obtenue !")
+            .setDescription(
+              "🎟️ -5 invites\n\n💎 `" +
+                key +
+                "`\n\nUtilise `/redeem` ou **My Key** en jeu."
+            )
+            .setFooter({ text: "Restant: " + getInvitePoints(data, uid) + " invite(s)" })
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    return interaction.editReply({ content: "❓ Bouton inconnu." });
+  }
+
+  // ─── SLASH COMMANDS ────────────────────────────────────
   if (!interaction.isChatInputCommand()) return;
 
   const cmd = interaction.commandName;
@@ -376,7 +736,7 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
-  const publicCmds = ["redeem", "checkkey", "info", "spin", "dice"];
+  const publicCmds = ["redeem", "checkkey", "info", "spin", "dice", "invites"];
   const needsAdmin = !publicCmds.includes(cmd);
 
   if (needsAdmin && !isBotAdmin(interaction.user.id)) {
@@ -403,6 +763,9 @@ client.on("interactionCreate", async (interaction) => {
     data.diceBonus = data.diceBonus || {};
     data.globalSpinBonus = data.globalSpinBonus || 0;
     data.globalDiceBonus = data.globalDiceBonus || 0;
+    data.invites = data.invites || {};
+    data.invitesUsed = data.invitesUsed || {};
+    data.invitedUsers = data.invitedUsers || {};
 
     // ─── CREATEKEY ─────────────────────────────────────────
     if (cmd === "createkey") {
@@ -455,7 +818,6 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // ─── GIVEKEY ───────────────────────────────────────────
     if (cmd === "givekey") {
       const user = interaction.options.getUser("user");
       const durationStr = interaction.options.getString("duration");
@@ -522,7 +884,6 @@ client.on("interactionCreate", async (interaction) => {
       }
     }
 
-    // ─── REDEEM ────────────────────────────────────────────
     if (cmd === "redeem") {
       const keyInput = interaction.options.getString("key").trim().toUpperCase();
       const username = interaction.options.getString("username").trim();
@@ -601,7 +962,6 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // ─── CHECKKEY ──────────────────────────────────────────
     if (cmd === "checkkey") {
       const keyInput = interaction.options.getString("key").trim().toUpperCase();
       const keyData = data.keys[keyInput];
@@ -637,7 +997,6 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // ─── ADD ───────────────────────────────────────────────
     if (cmd === "add") {
       const username = interaction.options.getString("username").toLowerCase();
       const durationStr = interaction.options.getString("duration");
@@ -664,7 +1023,6 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // ─── REMOVE ────────────────────────────────────────────
     if (cmd === "remove") {
       const username = interaction.options.getString("username").toLowerCase();
       delete data.whitelist[username];
@@ -681,7 +1039,6 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // ─── INFO ──────────────────────────────────────────────
     if (cmd === "info") {
       const username = interaction.options.getString("username").toLowerCase();
       const now = Math.floor(Date.now() / 1000);
@@ -709,7 +1066,6 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // ─── LIST ──────────────────────────────────────────────
     if (cmd === "list") {
       const now = Math.floor(Date.now() / 1000);
       const life = Object.keys(data.lifetimeWhitelist);
@@ -817,7 +1173,7 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // ─── DICE (4 couleurs, 1×/jour) ────────────────────────
+    // ─── DICE ──────────────────────────────────────────────
     if (cmd === "dice") {
       const uid = interaction.user.id;
       const now = Date.now();
@@ -852,8 +1208,6 @@ client.on("interactionCreate", async (interaction) => {
 
       const pick = interaction.options.getString("color");
       const pickObj = DICE_COLORS.find((c) => c.value === pick) || DICE_COLORS[0];
-
-      // Tire 4 couleurs au hasard (avec remise possible)
       const rolled = [];
       for (let i = 0; i < 4; i++) {
         rolled.push(DICE_COLORS[Math.floor(Math.random() * DICE_COLORS.length)]);
@@ -900,7 +1254,7 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // ─── RESETSPIN ─────────────────────────────────────────
+    // ─── RESET / GIVE SPIN DICE ────────────────────────────
     if (cmd === "resetspin") {
       const user = interaction.options.getUser("user");
       const all = interaction.options.getBoolean("all");
@@ -940,7 +1294,6 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // ─── RESETDICE ─────────────────────────────────────────
     if (cmd === "resetdice") {
       const user = interaction.options.getUser("user");
       const all = interaction.options.getBoolean("all");
@@ -980,7 +1333,6 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // ─── GIVEALLSPIN ───────────────────────────────────────
     if (cmd === "giveallspin") {
       const amount = interaction.options.getInteger("amount") || 1;
       data.spins = {};
@@ -1004,7 +1356,6 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // ─── GIVEALLDICE ───────────────────────────────────────
     if (cmd === "givealldice") {
       const amount = interaction.options.getInteger("amount") || 1;
       data.dice = {};
@@ -1028,7 +1379,6 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // ─── GIVESPIN ──────────────────────────────────────────
     if (cmd === "givespin") {
       const user = interaction.options.getUser("user");
       const amount = interaction.options.getInteger("amount") || 1;
@@ -1042,17 +1392,12 @@ client.on("interactionCreate", async (interaction) => {
             .setColor(0x2ecc71)
             .setTitle("🎁 Spin donné")
             .setDescription(
-              "**" +
-                amount +
-                "** spin(s) → **" +
-                user.tag +
-                "**\nCooldown reset ✅"
+              "**" + amount + "** spin(s) → **" + user.tag + "**\nCooldown reset ✅"
             ),
         ],
       });
     }
 
-    // ─── GIVEDICE ──────────────────────────────────────────
     if (cmd === "givedice") {
       const user = interaction.options.getUser("user");
       const amount = interaction.options.getInteger("amount") || 1;
@@ -1066,22 +1411,98 @@ client.on("interactionCreate", async (interaction) => {
             .setColor(0x2ecc71)
             .setTitle("🎁 Dice donné")
             .setDescription(
-              "**" +
-                amount +
-                "** dice → **" +
-                user.tag +
-                "**\nCooldown reset ✅"
+              "**" + amount + "** dice → **" + user.tag + "**\nCooldown reset ✅"
             ),
         ],
       });
     }
 
+    // ─── INVITES COMMANDS ──────────────────────────────────
+    if (cmd === "invites") {
+      const uid = interaction.user.id;
+      const pts = getInvitePoints(data, uid);
+      const used = data.invitesUsed[uid] || 0;
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x9b59b6)
+            .setTitle("🎟️ Tes invites")
+            .setDescription(
+              "Points disponibles: **" +
+                pts +
+                "**\n" +
+                "Déjà dépensés: **" +
+                used +
+                "**\n\n" +
+                "Échange via le **panel** du salon ou les boutons."
+            )
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    if (cmd === "invitepanel") {
+      // Message public (pas ephemeral) qui reste dans le salon
+      try {
+        await interaction.deleteReply().catch(() => {});
+      } catch (_) {}
+      await interaction.channel.send({
+        embeds: [buildInvitePanelEmbed()],
+        components: [buildInvitePanelButtons()],
+      });
+      // confirmation éphémère si possible
+      try {
+        await interaction.followUp({
+          content: "✅ Panel invites posté dans ce salon.",
+          ephemeral: true,
+        });
+      } catch (_) {}
+      addLog("invitepanel", interaction.user.tag, interaction.channelId, "");
+      return;
+    }
+
+    if (cmd === "addinvites") {
+      const user = interaction.options.getUser("user");
+      const amount = interaction.options.getInteger("amount");
+      addInvitePoints(data, user.id, amount);
+      saveData(data);
+      addLog("addinvites", interaction.user.tag, user.tag, String(amount));
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("➕ Invites ajoutées")
+            .setDescription(
+              "**+" +
+                amount +
+                "** → **" +
+                user.tag +
+                "**\nTotal: **" +
+                getInvitePoints(data, user.id) +
+                "**"
+            ),
+        ],
+      });
+    }
+
+    if (cmd === "setinvites") {
+      const user = interaction.options.getUser("user");
+      const amount = interaction.options.getInteger("amount");
+      data.invites[user.id] = amount;
+      saveData(data);
+      addLog("setinvites", interaction.user.tag, user.tag, String(amount));
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x3498db)
+            .setTitle("✏️ Invites définies")
+            .setDescription("**" + user.tag + "** → **" + amount + "** point(s)"),
+        ],
+      });
+    }
+
     return interaction.editReply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0x95a5a6)
-          .setTitle("❓ Commande inconnue"),
-      ],
+      embeds: [new EmbedBuilder().setColor(0x95a5a6).setTitle("❓ Commande inconnue")],
     });
   } catch (err) {
     console.error("[ERR]", cmd, err);
