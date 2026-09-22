@@ -1,6 +1,7 @@
 /**
  * LARP TP - Discord Bot + API
- * + système d'invites (conversion clés / spins) + panel permanent
+ * Invites · Keydrop · Logs · Spin · Dice
+ * Language: English
  */
 require("dotenv").config();
 const fs = require("fs");
@@ -25,6 +26,7 @@ const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
 const API_SECRET = process.env.API_SECRET || "change_me";
 const PORT = process.env.PORT || 3000;
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || ""; // optional Discord channel for live logs
 const BOT_ADMINS = (process.env.BOT_ADMINS || "")
   .split(",")
   .map((id) => id.trim())
@@ -36,13 +38,11 @@ const LOCAL_FALLBACK = path.join(__dirname, "data.json");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-// Coûts invites
-const INVITE_COST_1H = 1; // 1 invite → clé 1h
-const INVITE_COST_SPINS = 1; // 1 invite → 2 spins
-const INVITE_COST_1D = 5; // 5 invites → clé 1d
+const INVITE_COST_1H = 1;
+const INVITE_COST_SPINS = 1;
+const INVITE_COST_1D = 5;
 const SPINS_REWARD = 2;
 
-// ─── Couleurs dice ─────────────────────────────────────────
 const DICE_COLORS = [
   { name: "Red", emoji: "🔴", value: "Red", color: 0xe74c3c },
   { name: "Blue", emoji: "🔵", value: "Blue", color: 0x3498db },
@@ -51,6 +51,9 @@ const DICE_COLORS = [
   { name: "Orange", emoji: "🟠", value: "Orange", color: 0xe67e22 },
   { name: "Violet", emoji: "🟣", value: "Violet", color: 0x9b59b6 },
 ];
+
+// Active keydrops: messageId → { keysLeft, duration, claimed: Set }
+const activeDrops = new Map();
 
 function loadData() {
   for (const file of [DATA_FILE, LOCAL_FALLBACK]) {
@@ -69,9 +72,10 @@ function loadData() {
         d.diceBonus = d.diceBonus || {};
         d.globalSpinBonus = d.globalSpinBonus || 0;
         d.globalDiceBonus = d.globalDiceBonus || 0;
-        d.invites = d.invites || {}; // userId → points disponibles
-        d.invitesUsed = d.invitesUsed || {}; // userId → total déjà dépensé
-        d.invitedUsers = d.invitedUsers || {}; // invitedUserId → inviterId (anti multi-compte simple)
+        d.invites = d.invites || {};
+        d.invitesUsed = d.invitesUsed || {};
+        d.invitedUsers = d.invitedUsers || {};
+        d.tpLogs = d.tpLogs || [];
         return d;
       }
     } catch (e) {
@@ -94,12 +98,14 @@ function loadData() {
     invites: {},
     invitesUsed: {},
     invitedUsers: {},
+    tpLogs: [],
   };
 }
 
 function saveData(data) {
   try {
-    if (data.logs && data.logs.length > 150) data.logs = data.logs.slice(-150);
+    if (data.logs && data.logs.length > 200) data.logs = data.logs.slice(-200);
+    if (data.tpLogs && data.tpLogs.length > 200) data.tpLogs = data.tpLogs.slice(-200);
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
   } catch (e) {
     console.warn("saveData failed", e.message);
@@ -114,14 +120,46 @@ function saveData(data) {
 function addLog(action, by, target, details) {
   try {
     const data = loadData();
-    data.logs.push({
+    const entry = {
       at: new Date().toISOString(),
       action,
-      by,
+      by: by || "",
       target: target || "",
       details: details || "",
-    });
+    };
+    data.logs.push(entry);
     saveData(data);
+    // Live log to Discord channel if configured
+    if (LOG_CHANNEL_ID && client.isReady()) {
+      const ch = client.channels.cache.get(LOG_CHANNEL_ID);
+      if (ch && ch.send) {
+        const colors = {
+          redeem: 0x2ecc71,
+          tp: 0x3498db,
+          createkey: 0x00e5ff,
+          keydrop: 0xf1c40f,
+          spin_win: 0x2ecc71,
+          dice_win: 0x2ecc71,
+          invite_claim: 0x9b59b6,
+        };
+        ch.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(colors[action] || 0x95a5a6)
+              .setTitle("📋 " + String(action).toUpperCase())
+              .setDescription(
+                "**By:** " +
+                  (by || "—") +
+                  "\n**Target:** " +
+                  (target || "—") +
+                  "\n**Details:** " +
+                  (details || "—")
+              )
+              .setTimestamp(),
+          ],
+        }).catch(() => {});
+      }
+    }
   } catch (e) {
     console.warn("addLog", e.message);
   }
@@ -164,7 +202,7 @@ function applyAccess(data, username, parsed) {
 }
 
 function timeLeft(ms) {
-  if (ms <= 0) return "maintenant";
+  if (ms <= 0) return "now";
   const h = Math.floor(ms / 3600000);
   const m = Math.floor((ms % 3600000) / 60000);
   if (h > 0) return `~**${h}h ${m}m**`;
@@ -192,22 +230,21 @@ function makeKey1h(source) {
   return makeKey("1h", 3600, source);
 }
 
-/** Envoie la clé en MP à l'utilisateur. Retourne true si OK. */
 async function sendKeyDM(user, key, durationStr) {
   try {
     await user.send({
       embeds: [
         new EmbedBuilder()
           .setColor(0x00e5ff)
-          .setTitle("🔑 Ta clé LARP TP")
+          .setTitle("🔑 Your LARP TP Key")
           .setDescription(
-            "Voici ta clé :\n\n🔑 `" +
+            "Here is your key:\n\n🔑 `" +
               key +
-              "`\n⏱️ Durée: **" +
+              "`\n⏱️ Duration: **" +
               durationStr +
               "**\n\n" +
-              "➡️ En jeu: **My Key → Redeem**\n" +
-              "➡️ Ou `/redeem` sur Discord"
+              "➡️ In-game: **My Key → Redeem**\n" +
+              "➡️ Or `/redeem` on Discord"
           )
           .setFooter({ text: "LARP TP" })
           .setTimestamp(),
@@ -273,7 +310,7 @@ function spinVisual(roll, win) {
     " / 100    │\n" +
     "  └──────────────┘\n" +
     "```\n" +
-    (win ? "✨ **JACKPOT** ✨" : "💨 *rien cette fois...*")
+    (win ? "✨ **JACKPOT** ✨" : "💨 *nothing this time...*")
   );
 }
 
@@ -288,33 +325,33 @@ function diceVisual(pickEmoji, pick, rolledEmojis, match) {
     "  │\n" +
     "  └──────────────────┘\n" +
     "```\n" +
-    "Tu as choisi " +
+    "You picked " +
     pickEmoji +
     " **" +
     pick +
     "**\n" +
-    "Les 4 couleurs : " +
+    "The 4 colors: " +
     line +
     "\n\n" +
     (match
-      ? "🎉🎊 **TA COULEUR EST SORTIE !** Tu gagnes une clé **1h** 🔑"
-      : "💔 Ta couleur n'est pas sortie... retente demain !")
+      ? "🎉🎊 **YOUR COLOR APPEARED!** You win a **1h** key 🔑"
+      : "💔 Your color did not appear... try again tomorrow!")
   );
 }
 
 function buildInvitePanelEmbed() {
   return new EmbedBuilder()
     .setColor(0x9b59b6)
-    .setTitle("🎟️ Panel Invites — LARP TP")
+    .setTitle("🎟️ Invite Panel — LARP TP")
     .setDescription(
-      "Échange tes **points d'invites** contre des récompenses !\n\n" +
-        "**Taux d'échange :**\n" +
-        "• `1` invite → 🔑 clé **1h** *(envoyée en MP)*\n" +
+      "Exchange your **invite points** for rewards!\n\n" +
+        "**Rates:**\n" +
+        "• `1` invite → 🔑 **1h** key *(sent in DM)*\n" +
         "• `1` invite → 🎰 **2 spins**\n" +
-        "• `5` invites → 🔑 clé **1 jour** *(envoyée en MP)*\n\n" +
-        "⚠️ Chaque point ne peut être **dépensé qu'une seule fois**.\n" +
-        "Les admins attribuent les points avec `/addinvites`.\n" +
-        "Clique sur un bouton ci-dessous pour échanger."
+        "• `5` invites → 🔑 **1 day** key *(sent in DM)*\n\n" +
+        "⚠️ Each point can only be **spent once**.\n" +
+        "Admins grant points with `/addinvites`.\n" +
+        "Click a button below to claim."
     )
     .setFooter({ text: "LARP TP • Invites" })
     .setTimestamp();
@@ -324,7 +361,7 @@ function buildInvitePanelButtons() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId("inv_claim_1h")
-      .setLabel("1 invite → Clé 1h")
+      .setLabel("1 invite → 1h key")
       .setEmoji("🔑")
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
@@ -334,12 +371,12 @@ function buildInvitePanelButtons() {
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId("inv_claim_1d")
-      .setLabel("5 invites → Clé 1j")
+      .setLabel("5 invites → 1d key")
       .setEmoji("💎")
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId("inv_check")
-      .setLabel("Mes invites")
+      .setLabel("My invites")
       .setEmoji("📊")
       .setStyle(ButtonStyle.Secondary)
   );
@@ -348,57 +385,57 @@ function buildInvitePanelButtons() {
 const commands = [
   new SlashCommandBuilder()
     .setName("createkey")
-    .setDescription("🔑 Créer une clé LARP TP")
+    .setDescription("🔑 Create LARP TP key(s)")
     .addStringOption((o) =>
       o.setName("duration").setDescription("30m / 1h / 1d / lifetime").setRequired(true)
     )
     .addIntegerOption((o) =>
-      o.setName("amount").setDescription("Nombre de clés (1-20)").setMinValue(1).setMaxValue(20)
+      o.setName("amount").setDescription("Number of keys (1-20)").setMinValue(1).setMaxValue(20)
     ),
   new SlashCommandBuilder()
     .setName("givekey")
-    .setDescription("🎁 Créer une clé et l'envoyer en MP")
-    .addUserOption((o) => o.setName("user").setDescription("Membre").setRequired(true))
+    .setDescription("🎁 Create a key and DM it")
+    .addUserOption((o) => o.setName("user").setDescription("Member").setRequired(true))
     .addStringOption((o) =>
       o.setName("duration").setDescription("30m / 1h / 1d / lifetime").setRequired(true)
     ),
   new SlashCommandBuilder()
     .setName("redeem")
-    .setDescription("✅ Utiliser une clé")
-    .addStringOption((o) => o.setName("key").setDescription("Clé LARP-XXXX").setRequired(true))
+    .setDescription("✅ Redeem a key")
+    .addStringOption((o) => o.setName("key").setDescription("LARP-XXXX key").setRequired(true))
     .addStringOption((o) =>
-      o.setName("username").setDescription("Pseudo Roblox").setRequired(true)
+      o.setName("username").setDescription("Roblox username").setRequired(true)
     ),
   new SlashCommandBuilder()
     .setName("checkkey")
-    .setDescription("🔍 Vérifier une clé")
-    .addStringOption((o) => o.setName("key").setDescription("Clé").setRequired(true)),
+    .setDescription("🔍 Check a key")
+    .addStringOption((o) => o.setName("key").setDescription("Key").setRequired(true)),
   new SlashCommandBuilder()
     .setName("add")
-    .setDescription("➕ Whitelist sans clé")
-    .addStringOption((o) => o.setName("username").setDescription("Pseudo Roblox").setRequired(true))
+    .setDescription("➕ Whitelist without key")
+    .addStringOption((o) => o.setName("username").setDescription("Roblox username").setRequired(true))
     .addStringOption((o) =>
       o.setName("duration").setDescription("1h / lifetime").setRequired(true)
     ),
   new SlashCommandBuilder()
     .setName("remove")
-    .setDescription("➖ Retirer whitelist")
-    .addStringOption((o) => o.setName("username").setDescription("Pseudo Roblox").setRequired(true)),
+    .setDescription("➖ Remove from whitelist")
+    .addStringOption((o) => o.setName("username").setDescription("Roblox username").setRequired(true)),
   new SlashCommandBuilder()
     .setName("info")
-    .setDescription("👤 Info joueur")
-    .addStringOption((o) => o.setName("username").setDescription("Pseudo Roblox").setRequired(true)),
-  new SlashCommandBuilder().setName("list").setDescription("📋 Liste whitelist"),
+    .setDescription("👤 Player info")
+    .addStringOption((o) => o.setName("username").setDescription("Roblox username").setRequired(true)),
+  new SlashCommandBuilder().setName("list").setDescription("📋 Whitelist list"),
   new SlashCommandBuilder()
     .setName("spin")
-    .setDescription("🎰 Tour quotidien — chance de gagner une clé 1h (1× / jour)"),
+    .setDescription("🎰 Daily spin — chance to win a 1h key (1× / day)"),
   new SlashCommandBuilder()
     .setName("dice")
-    .setDescription("🎲 Choisis 1 couleur — 4 sortent au hasard, si la tienne apparaît = clé 1h (1×/jour)")
+    .setDescription("🎲 Pick 1 color — 4 roll, if yours appears = 1h key (1×/day)")
     .addStringOption((o) =>
       o
         .setName("color")
-        .setDescription("Ta couleur")
+        .setDescription("Your color")
         .setRequired(true)
         .addChoices(
           { name: "🔴 Red", value: "Red" },
@@ -411,95 +448,224 @@ const commands = [
     ),
   new SlashCommandBuilder()
     .setName("resetspin")
-    .setDescription("🔄 Reset le cooldown spin (user ou all)")
-    .addUserOption((o) => o.setName("user").setDescription("Membre"))
-    .addBooleanOption((o) => o.setName("all").setDescription("Reset tout le monde")),
+    .setDescription("🔄 Reset spin cooldown (user or all)")
+    .addUserOption((o) => o.setName("user").setDescription("Member"))
+    .addBooleanOption((o) => o.setName("all").setDescription("Reset everyone")),
   new SlashCommandBuilder()
     .setName("resetdice")
-    .setDescription("🔄 Reset le cooldown dice (user ou all)")
-    .addUserOption((o) => o.setName("user").setDescription("Membre"))
-    .addBooleanOption((o) => o.setName("all").setDescription("Reset tout le monde")),
+    .setDescription("🔄 Reset dice cooldown (user or all)")
+    .addUserOption((o) => o.setName("user").setDescription("Member"))
+    .addBooleanOption((o) => o.setName("all").setDescription("Reset everyone")),
   new SlashCommandBuilder()
     .setName("giveallspin")
-    .setDescription("🎁 Reset cooldown + bonus spin pour tout le monde")
+    .setDescription("🎁 Reset cooldown + global spin bonus for everyone")
     .addIntegerOption((o) =>
-      o
-        .setName("amount")
-        .setDescription("Bonus globaux (défaut 1)")
-        .setMinValue(1)
-        .setMaxValue(10)
+      o.setName("amount").setDescription("Global bonus (default 1)").setMinValue(1).setMaxValue(10)
     ),
   new SlashCommandBuilder()
     .setName("givealldice")
-    .setDescription("🎁 Reset cooldown + bonus dice pour tout le monde")
+    .setDescription("🎁 Reset cooldown + global dice bonus for everyone")
     .addIntegerOption((o) =>
-      o
-        .setName("amount")
-        .setDescription("Bonus globaux (défaut 1)")
-        .setMinValue(1)
-        .setMaxValue(10)
+      o.setName("amount").setDescription("Global bonus (default 1)").setMinValue(1).setMaxValue(10)
     ),
   new SlashCommandBuilder()
     .setName("givespin")
-    .setDescription("🎁 Donne des spins à un user")
-    .addUserOption((o) => o.setName("user").setDescription("Membre").setRequired(true))
+    .setDescription("🎁 Give spins to a user")
+    .addUserOption((o) => o.setName("user").setDescription("Member").setRequired(true))
     .addIntegerOption((o) =>
-      o.setName("amount").setDescription("Nombre (défaut 1)").setMinValue(1).setMaxValue(20)
+      o.setName("amount").setDescription("Amount (default 1)").setMinValue(1).setMaxValue(20)
     ),
   new SlashCommandBuilder()
     .setName("givedice")
-    .setDescription("🎁 Donne des dice à un user")
-    .addUserOption((o) => o.setName("user").setDescription("Membre").setRequired(true))
+    .setDescription("🎁 Give dice to a user")
+    .addUserOption((o) => o.setName("user").setDescription("Member").setRequired(true))
     .addIntegerOption((o) =>
-      o.setName("amount").setDescription("Nombre (défaut 1)").setMinValue(1).setMaxValue(20)
+      o.setName("amount").setDescription("Amount (default 1)").setMinValue(1).setMaxValue(20)
     ),
-  // ─── INVITES ─────────────────────────────────────────────
-  new SlashCommandBuilder()
-    .setName("invites")
-    .setDescription("🎟️ Voir tes points d'invites"),
+  new SlashCommandBuilder().setName("invites").setDescription("🎟️ Check your invite points"),
   new SlashCommandBuilder()
     .setName("invitepanel")
-    .setDescription("📌 Poster le panel d'invites (reste dans le salon)"),
+    .setDescription("📌 Post the invite panel (stays in channel)"),
   new SlashCommandBuilder()
     .setName("addinvites")
-    .setDescription("➕ Ajouter des points d'invites à un user (admin)")
-    .addUserOption((o) => o.setName("user").setDescription("Membre").setRequired(true))
+    .setDescription("➕ Add invite points to a user (admin)")
+    .addUserOption((o) => o.setName("user").setDescription("Member").setRequired(true))
     .addIntegerOption((o) =>
-      o.setName("amount").setDescription("Nombre de points").setRequired(true).setMinValue(1).setMaxValue(100)
+      o.setName("amount").setDescription("Points").setRequired(true).setMinValue(1).setMaxValue(100)
     ),
   new SlashCommandBuilder()
     .setName("setinvites")
-    .setDescription("✏️ Définir les points d'invites d'un user (admin)")
-    .addUserOption((o) => o.setName("user").setDescription("Membre").setRequired(true))
+    .setDescription("✏️ Set invite points for a user (admin)")
+    .addUserOption((o) => o.setName("user").setDescription("Member").setRequired(true))
     .addIntegerOption((o) =>
-      o.setName("amount").setDescription("Nouveau total").setRequired(true).setMinValue(0).setMaxValue(999)
+      o.setName("amount").setDescription("New total").setRequired(true).setMinValue(0).setMaxValue(999)
+    ),
+  // KEYDROP
+  new SlashCommandBuilder()
+    .setName("keydrop")
+    .setDescription("🎁 Drop claimable keys in this channel")
+    .addStringOption((o) =>
+      o.setName("duration").setDescription("Key duration (e.g. 1h, 1d)").setRequired(true)
+    )
+    .addIntegerOption((o) =>
+      o
+        .setName("amount")
+        .setDescription("How many keys can be claimed")
+        .setRequired(true)
+        .setMinValue(1)
+        .setMaxValue(50)
+    ),
+  // LOGS
+  new SlashCommandBuilder()
+    .setName("logs")
+    .setDescription("📋 View recent bot logs")
+    .addIntegerOption((o) =>
+      o.setName("limit").setDescription("How many (default 15)").setMinValue(5).setMaxValue(30)
+    )
+    .addStringOption((o) =>
+      o
+        .setName("type")
+        .setDescription("Filter by type")
+        .addChoices(
+          { name: "All", value: "all" },
+          { name: "Redeem", value: "redeem" },
+          { name: "TP", value: "tp" },
+          { name: "Keydrop", value: "keydrop" },
+          { name: "Spin/Dice", value: "games" },
+          { name: "Invites", value: "invite" }
+        )
+    ),
+  new SlashCommandBuilder()
+    .setName("tplogs")
+    .setDescription("📍 View recent in-game TP logs")
+    .addIntegerOption((o) =>
+      o.setName("limit").setDescription("How many (default 15)").setMinValue(5).setMaxValue(30)
     ),
 ].map((c) => c.toJSON());
 
-// GuildMembers retiré → compatible Bot-Hosting (pas d'intent privilégié)
-// Les points d'invites se donnent avec /addinvites (admin)
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
 client.once("clientReady", () => {
-  console.log("[BOT] Connecté:", client.user.tag);
-  console.log("[BOT] Admins Discord IDs:", BOT_ADMINS.join(", ") || "(aucun)");
+  console.log("[BOT] Connected:", client.user.tag);
+  console.log("[BOT] Admin IDs:", BOT_ADMINS.join(", ") || "(none)");
 });
 client.once("ready", () => {
-  console.log("[BOT] Connecté (ready):", client.user.tag);
-  console.log("[BOT] Admins Discord IDs:", BOT_ADMINS.join(", ") || "(aucun)");
+  console.log("[BOT] Connected (ready):", client.user.tag);
+  console.log("[BOT] Admin IDs:", BOT_ADMINS.join(", ") || "(none)");
 });
 
 client.on("interactionCreate", async (interaction) => {
-  // ─── BOUTONS PANEL INVITES ─────────────────────────────
+  // ─── BUTTONS ───────────────────────────────────────────
   if (interaction.isButton()) {
     const id = interaction.customId;
+
+    // Keydrop claim
+    if (id.startsWith("keydrop_claim_")) {
+      try {
+        await interaction.deferReply({ ephemeral: true });
+      } catch {
+        return;
+      }
+      const msgId = id.replace("keydrop_claim_", "");
+      const drop = activeDrops.get(msgId);
+      if (!drop) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Drop expired")
+              .setDescription("This keydrop is no longer active."),
+          ],
+        });
+      }
+      if (drop.claimed.has(interaction.user.id)) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("⚠️ Already claimed")
+              .setDescription("You already claimed a key from this drop."),
+          ],
+        });
+      }
+      if (drop.keysLeft <= 0) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Sold out")
+              .setDescription("All keys from this drop have been claimed."),
+          ],
+        });
+      }
+
+      drop.keysLeft -= 1;
+      drop.claimed.add(interaction.user.id);
+
+      const data = loadData();
+      const parsed = parseDuration(drop.duration);
+      const { key, data: kData } = makeKey(
+        drop.duration,
+        parsed ? parsed.seconds : 3600,
+        "keydrop"
+      );
+      data.keys[key] = kData;
+      saveData(data);
+      addLog("keydrop", interaction.user.tag, "", key + " (" + drop.duration + ")");
+
+      const dmOk = await sendKeyDM(interaction.user, key, drop.duration);
+
+      // Update drop message
+      try {
+        const embed = EmbedBuilder.from(drop.embedData);
+        embed.setDescription(
+          drop.baseDesc +
+            "\n\n**Remaining:** `" +
+            drop.keysLeft +
+            "` / `" +
+            drop.total +
+            "`"
+        );
+        if (drop.keysLeft <= 0) {
+          embed.setColor(0x95a5a6);
+          embed.setTitle("🎁 Keydrop — SOLD OUT");
+        }
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId("keydrop_claim_" + msgId)
+            .setLabel(drop.keysLeft > 0 ? "Claim key" : "Sold out")
+            .setEmoji("🔑")
+            .setStyle(ButtonStyle.Success)
+            .setDisabled(drop.keysLeft <= 0)
+        );
+        await interaction.message.edit({ embeds: [embed], components: [row] });
+      } catch (_) {}
+
+      if (drop.keysLeft <= 0) activeDrops.delete(msgId);
+
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("✅ Key claimed!")
+            .setDescription(
+              dmOk
+                ? "📩 **" + drop.duration + "** key sent to your **DMs**!"
+                : "⚠️ DMs closed — key: `" + key + "`"
+            )
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    // Invite buttons
     if (!id.startsWith("inv_")) return;
 
     try {
       await interaction.deferReply({ ephemeral: true });
-    } catch (e) {
+    } catch {
       return;
     }
 
@@ -517,18 +683,15 @@ client.on("interactionCreate", async (interaction) => {
         embeds: [
           new EmbedBuilder()
             .setColor(0x9b59b6)
-            .setTitle("📊 Tes invites")
+            .setTitle("📊 Your invites")
             .setDescription(
-              "🎟️ Points disponibles: **" +
+              "🎟️ Available points: **" +
                 pts +
                 "**\n" +
-                "✅ Déjà dépensés: **" +
+                "✅ Already spent: **" +
                 used +
                 "**\n\n" +
-                "**Échanges :**\n" +
-                "• 1 → clé 1h\n" +
-                "• 1 → 2 spins\n" +
-                "• 5 → clé 1 jour"
+                "**Rates:**\n• 1 → 1h key\n• 1 → 2 spins\n• 5 → 1 day key"
             )
             .setTimestamp(),
         ],
@@ -541,9 +704,9 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0xe74c3c)
-              .setTitle("❌ Pas assez d'invites")
+              .setTitle("❌ Not enough invites")
               .setDescription(
-                "Il te faut **1** invite.\nTu as: **" + getInvitePoints(data, uid) + "**"
+                "You need **1** invite.\nYou have: **" + getInvitePoints(data, uid) + "**"
               ),
           ],
         });
@@ -551,20 +714,18 @@ client.on("interactionCreate", async (interaction) => {
       const { key, data: kData } = makeKey1h("invite");
       data.keys[key] = kData;
       saveData(data);
-      addLog("inv_claim_1h", interaction.user.tag, "", key);
+      addLog("invite_claim", interaction.user.tag, "", "1h key " + key);
       const dmOk = await sendKeyDM(interaction.user, key, "1h");
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x2ecc71)
-            .setTitle("✅ Clé 1h obtenue !")
+            .setTitle("✅ 1h key claimed!")
             .setDescription(
               "🎟️ -1 invite\n\n" +
-                (dmOk
-                  ? "📩 Clé envoyée en **MP** !"
-                  : "⚠️ MP fermés — clé: `" + key + "`")
+                (dmOk ? "📩 Key sent to your **DMs**!" : "⚠️ DMs closed — key: `" + key + "`")
             )
-            .setFooter({ text: "Restant: " + getInvitePoints(data, uid) + " invite(s)" })
+            .setFooter({ text: "Left: " + getInvitePoints(data, uid) + " invite(s)" })
             .setTimestamp(),
         ],
       });
@@ -576,26 +737,24 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0xe74c3c)
-              .setTitle("❌ Pas assez d'invites")
+              .setTitle("❌ Not enough invites")
               .setDescription(
-                "Il te faut **1** invite.\nTu as: **" + getInvitePoints(data, uid) + "**"
+                "You need **1** invite.\nYou have: **" + getInvitePoints(data, uid) + "**"
               ),
           ],
         });
       }
       data.spinsBonus[uid] = (data.spinsBonus[uid] || 0) + SPINS_REWARD;
-      delete data.spins[uid]; // reset cooldown pour pouvoir spin tout de suite
+      delete data.spins[uid];
       saveData(data);
-      addLog("inv_claim_spins", interaction.user.tag, "", String(SPINS_REWARD));
+      addLog("invite_claim", interaction.user.tag, "", "2 spins");
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x2ecc71)
-            .setTitle("✅ 2 Spins obtenus !")
-            .setDescription(
-              "🎟️ -1 invite\n\n🎰 Tu as reçu **2 spins** bonus.\nUtilise `/spin` maintenant !"
-            )
-            .setFooter({ text: "Restant: " + getInvitePoints(data, uid) + " invite(s)" })
+            .setTitle("✅ 2 Spins claimed!")
+            .setDescription("🎟️ -1 invite\n\n🎰 You received **2 bonus spins**.\nUse `/spin` now!")
+            .setFooter({ text: "Left: " + getInvitePoints(data, uid) + " invite(s)" })
             .setTimestamp(),
         ],
       });
@@ -607,9 +766,9 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0xe74c3c)
-              .setTitle("❌ Pas assez d'invites")
+              .setTitle("❌ Not enough invites")
               .setDescription(
-                "Il te faut **5** invites.\nTu as: **" + getInvitePoints(data, uid) + "**"
+                "You need **5** invites.\nYou have: **" + getInvitePoints(data, uid) + "**"
               ),
           ],
         });
@@ -617,26 +776,24 @@ client.on("interactionCreate", async (interaction) => {
       const { key, data: kData } = makeKey("1d", 86400, "invite");
       data.keys[key] = kData;
       saveData(data);
-      addLog("inv_claim_1d", interaction.user.tag, "", key);
+      addLog("invite_claim", interaction.user.tag, "", "1d key " + key);
       const dmOk = await sendKeyDM(interaction.user, key, "1d");
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x2ecc71)
-            .setTitle("✅ Clé 1 jour obtenue !")
+            .setTitle("✅ 1 day key claimed!")
             .setDescription(
               "🎟️ -5 invites\n\n" +
-                (dmOk
-                  ? "📩 Clé envoyée en **MP** !"
-                  : "⚠️ MP fermés — clé: `" + key + "`")
+                (dmOk ? "📩 Key sent to your **DMs**!" : "⚠️ DMs closed — key: `" + key + "`")
             )
-            .setFooter({ text: "Restant: " + getInvitePoints(data, uid) + " invite(s)" })
+            .setFooter({ text: "Left: " + getInvitePoints(data, uid) + " invite(s)" })
             .setTimestamp(),
         ],
       });
     }
 
-    return interaction.editReply({ content: "❓ Bouton inconnu." });
+    return interaction.editReply({ content: "❓ Unknown button." });
   }
 
   // ─── SLASH COMMANDS ────────────────────────────────────
@@ -660,11 +817,11 @@ client.on("interactionCreate", async (interaction) => {
       embeds: [
         new EmbedBuilder()
           .setColor(0xe74c3c)
-          .setTitle("⛔ Accès refusé")
+          .setTitle("⛔ Access denied")
           .setDescription(
-            "Tu n'as pas la permission.\nTon ID: `" +
+            "You don't have permission.\nYour ID: `" +
               interaction.user.id +
-              "`\nAjoute-le dans **BOT_ADMINS** sur Render."
+              "`\nAdd it to **BOT_ADMINS** on your host."
           )
           .setTimestamp(),
       ],
@@ -682,8 +839,9 @@ client.on("interactionCreate", async (interaction) => {
     data.invites = data.invites || {};
     data.invitesUsed = data.invitesUsed || {};
     data.invitedUsers = data.invitedUsers || {};
+    data.tpLogs = data.tpLogs || [];
+    data.logs = data.logs || [];
 
-    // ─── CREATEKEY ─────────────────────────────────────────
     if (cmd === "createkey") {
       const durationStr = interaction.options.getString("duration");
       const amount = interaction.options.getInteger("amount") || 1;
@@ -693,8 +851,8 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0xe74c3c)
-              .setTitle("❌ Durée invalide")
-              .setDescription("Exemples: `30m` · `1h` · `1d` · `lifetime`"),
+              .setTitle("❌ Invalid duration")
+              .setDescription("Examples: `30m` · `1h` · `1d` · `lifetime`"),
           ],
         });
       }
@@ -721,10 +879,10 @@ client.on("interactionCreate", async (interaction) => {
         embeds: [
           new EmbedBuilder()
             .setColor(0x00e5ff)
-            .setTitle("🔑 " + amount + " clé(s) créée(s)")
+            .setTitle("🔑 " + amount + " key(s) created")
             .setDescription(
               created.map((k) => "🔑 `" + k + "`").join("\n") +
-                "\n\n⏱️ Durée: **" +
+                "\n\n⏱️ Duration: **" +
                 durationStr +
                 "**"
             )
@@ -743,8 +901,8 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0xe74c3c)
-              .setTitle("❌ Durée invalide")
-              .setDescription("Exemples: `30m` · `1h` · `1d` · `lifetime`"),
+              .setTitle("❌ Invalid duration")
+              .setDescription("Examples: `30m` · `1h` · `1d` · `lifetime`"),
           ],
         });
       }
@@ -761,43 +919,26 @@ client.on("interactionCreate", async (interaction) => {
         note: "DM " + user.tag,
       };
       saveData(data);
-      try {
-        await user.send({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0x00e5ff)
-              .setTitle("🎁 Clé LARP TP")
-              .setDescription(
-                "Tu as reçu une clé !\n\n🔑 `" +
-                  key +
-                  "`\n⏱️ Durée: **" +
-                  durationStr +
-                  "**\n\n" +
-                  "➡️ En jeu: **My Key → Redeem**\n" +
-                  "➡️ Ou utilise `/redeem`"
-              )
-              .setFooter({ text: "LARP TP" })
-              .setTimestamp(),
-          ],
-        });
+      const dmOk = await sendKeyDM(user, key, durationStr);
+      addLog("givekey", interaction.user.tag, user.tag, durationStr);
+      if (dmOk) {
         return interaction.editReply({
           embeds: [
             new EmbedBuilder()
               .setColor(0x2ecc71)
-              .setTitle("✅ Clé envoyée")
-              .setDescription("MP envoyé à **" + user.tag + "** 🎉"),
-          ],
-        });
-      } catch {
-        return interaction.editReply({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0xf39c12)
-              .setTitle("⚠️ MP impossible")
-              .setDescription("Clé: `" + key + "`\nDonne-la manuellement."),
+              .setTitle("✅ Key sent")
+              .setDescription("DM sent to **" + user.tag + "** 🎉"),
           ],
         });
       }
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xf39c12)
+            .setTitle("⚠️ DM failed")
+            .setDescription("Key: `" + key + "`\nGive it manually."),
+        ],
+      });
     }
 
     if (cmd === "redeem") {
@@ -809,8 +950,8 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0xe74c3c)
-              .setTitle("❌ Clé invalide")
-              .setDescription("Cette clé n'existe pas."),
+              .setTitle("❌ Invalid key")
+              .setDescription("This key does not exist."),
           ],
         });
       }
@@ -819,11 +960,11 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0xe74c3c)
-              .setTitle("🔒 Clé déjà utilisée")
+              .setTitle("🔒 Key already used")
               .setDescription(
                 keyData.robloxUsername
-                  ? "Utilisée par **" + keyData.robloxUsername + "**"
-                  : "Cette clé a déjà été consommée."
+                  ? "Used by **" + keyData.robloxUsername + "**"
+                  : "This key has already been redeemed."
               ),
           ],
         });
@@ -834,8 +975,8 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0xe74c3c)
-              .setTitle("❌ Pas de cumul")
-              .setDescription("Ce compte a déjà **lifetime** ♾️"),
+              .setTitle("❌ No stacking")
+              .setDescription("This account already has **lifetime** ♾️"),
           ],
         });
       }
@@ -845,8 +986,8 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0xe74c3c)
-              .setTitle("❌ Pas de cumul")
-              .setDescription("Ce compte a déjà du temps restant."),
+              .setTitle("❌ No stacking")
+              .setDescription("This account already has time remaining."),
           ],
         });
       }
@@ -859,16 +1000,22 @@ client.on("interactionCreate", async (interaction) => {
       keyData.usedAt = new Date().toISOString();
       keyData.robloxUsername = uname;
       saveData(data);
+      addLog(
+        "redeem",
+        interaction.user.tag,
+        uname,
+        keyInput + " → " + (keyData.lifetime ? "LIFETIME" : keyData.duration)
+      );
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x2ecc71)
-            .setTitle("✅ Clé acceptée !")
+            .setTitle("✅ Key accepted!")
             .setDescription(
-              "👤 Joueur: **" +
+              "👤 Player: **" +
                 username +
                 "**\n" +
-                "⏱️ Accès: **" +
+                "⏱️ Access: **" +
                 (keyData.lifetime ? "LIFETIME ♾️" : keyData.duration) +
                 "**"
             )
@@ -886,8 +1033,8 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0xe74c3c)
-              .setTitle("❌ Introuvable")
-              .setDescription("Cette clé n'existe pas."),
+              .setTitle("❌ Not found")
+              .setDescription("This key does not exist."),
           ],
         });
       }
@@ -896,9 +1043,9 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0x95a5a6)
-              .setTitle("🔒 Déjà utilisée")
+              .setTitle("🔒 Already used")
               .setDescription(
-                "Par: **" + (keyData.robloxUsername || keyData.usedBy || "?") + "**"
+                "By: **" + (keyData.robloxUsername || keyData.usedBy || "?") + "**"
               ),
           ],
         });
@@ -907,8 +1054,8 @@ client.on("interactionCreate", async (interaction) => {
         embeds: [
           new EmbedBuilder()
             .setColor(0x2ecc71)
-            .setTitle("✅ Clé valide")
-            .setDescription("⏱️ Durée: **" + keyData.duration + "**"),
+            .setTitle("✅ Valid key")
+            .setDescription("⏱️ Duration: **" + keyData.duration + "**"),
         ],
       });
     }
@@ -922,18 +1069,19 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0xe74c3c)
-              .setTitle("❌ Durée invalide")
-              .setDescription("Exemples: `1h` · `lifetime`"),
+              .setTitle("❌ Invalid duration")
+              .setDescription("Examples: `1h` · `lifetime`"),
           ],
         });
       }
       applyAccess(data, username, parsed);
       saveData(data);
+      addLog("add", interaction.user.tag, username, durationStr);
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x2ecc71)
-            .setTitle("➕ Whitelist ajoutée")
+            .setTitle("➕ Whitelisted")
             .setDescription("👤 **" + username + "** → ⏱️ **" + durationStr + "**"),
         ],
       });
@@ -945,12 +1093,13 @@ client.on("interactionCreate", async (interaction) => {
       delete data.pausedWhitelist[username];
       delete data.lifetimeWhitelist[username];
       saveData(data);
+      addLog("remove", interaction.user.tag, username, "");
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0xe74c3c)
-            .setTitle("➖ Retiré")
-            .setDescription("👤 **" + username + "** n'a plus d'accès."),
+            .setTitle("➖ Removed")
+            .setDescription("👤 **" + username + "** no longer has access."),
         ],
       });
     }
@@ -958,7 +1107,7 @@ client.on("interactionCreate", async (interaction) => {
     if (cmd === "info") {
       const username = interaction.options.getString("username").toLowerCase();
       const now = Math.floor(Date.now() / 1000);
-      let status = "❌ Aucun accès";
+      let status = "❌ No access";
       let color = 0x95a5a6;
       if (data.admins.includes(username)) {
         status = "👑 **ADMIN**";
@@ -968,14 +1117,14 @@ client.on("interactionCreate", async (interaction) => {
         color = 0x9b59b6;
       } else if (data.whitelist[username] && data.whitelist[username] > now) {
         const mins = Math.floor((data.whitelist[username] - now) / 60);
-        status = "🟢 **WHITELIST** — " + mins + " min restantes";
+        status = "🟢 **WHITELIST** — " + mins + " min left";
         color = 0x2ecc71;
       }
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(color)
-            .setTitle("👤 Info joueur")
+            .setTitle("👤 Player info")
             .setDescription("**" + username + "**\n" + status)
             .setTimestamp(),
         ],
@@ -993,16 +1142,16 @@ client.on("interactionCreate", async (interaction) => {
         embeds: [
           new EmbedBuilder()
             .setColor(0x00e5ff)
-            .setTitle("📋 Whitelist LARP TP")
+            .setTitle("📋 LARP TP Whitelist")
             .addFields(
               {
                 name: "♾️ Lifetime (" + life.length + ")",
-                value: life.length ? life.map((n) => "• " + n).join("\n") : "_aucun_",
+                value: life.length ? life.map((n) => "• " + n).join("\n") : "_none_",
                 inline: false,
               },
               {
-                name: "🟢 Actifs (" + active.length + ")",
-                value: active.length ? active.map((n) => "• " + n).join("\n") : "_aucun_",
+                name: "🟢 Active (" + active.length + ")",
+                value: active.length ? active.map((n) => "• " + n).join("\n") : "_none_",
                 inline: false,
               }
             )
@@ -1012,7 +1161,7 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // ─── SPIN ──────────────────────────────────────────────
+    // SPIN
     if (cmd === "spin") {
       const uid = interaction.user.id;
       const now = Date.now();
@@ -1027,23 +1176,15 @@ client.on("interactionCreate", async (interaction) => {
             new EmbedBuilder()
               .setColor(0xf39c12)
               .setTitle("🎰 SPIN — Cooldown")
-              .setDescription(
-                "⏳ Tu as déjà tourné aujourd'hui !\n\n" +
-                  "Reviens dans " +
-                  timeLeft(left) +
-                  "."
-              )
-              .setFooter({ text: "1 spin gratuit / jour • LARP TP" })
+              .setDescription("⏳ You already spun today!\n\nCome back in " + timeLeft(left) + ".")
+              .setFooter({ text: "1 free spin / day • LARP TP" })
               .setTimestamp(),
           ],
         });
       }
 
-      if (onCooldown && bonus > 0) {
-        consumeBonus(data, "spin", uid);
-      } else {
-        data.spins[uid] = now;
-      }
+      if (onCooldown && bonus > 0) consumeBonus(data, "spin", uid);
+      else data.spins[uid] = now;
 
       const win = Math.random() < 0.15;
       const roll = Math.floor(Math.random() * 100) + 1;
@@ -1053,22 +1194,21 @@ client.on("interactionCreate", async (interaction) => {
         const { key, data: kData } = makeKey1h("spin");
         data.keys[key] = kData;
         saveData(data);
+        addLog("spin_win", interaction.user.tag, "", key);
         const dmOk = await sendKeyDM(interaction.user, key, "1h");
         return interaction.editReply({
           embeds: [
             new EmbedBuilder()
               .setColor(0x2ecc71)
-              .setTitle("🎰 SPIN — 🎉 GAGNÉ !")
+              .setTitle("🎰 SPIN — 🎉 WIN!")
               .setDescription(
                 spinVisual(roll, true) +
                   "\n\n" +
                   (dmOk
-                    ? "📩 Clé **1h** envoyée en **MP** !"
-                    : "⚠️ MP fermés — clé: `" + key + "`")
+                    ? "📩 **1h** key sent to your **DMs**!"
+                    : "⚠️ DMs closed — key: `" + key + "`")
               )
-              .setFooter({
-                text: "Bonus restants: " + remaining + " • 1 spin / jour",
-              })
+              .setFooter({ text: "Bonus left: " + remaining + " • 1 spin / day" })
               .setTimestamp(),
           ],
         });
@@ -1079,19 +1219,15 @@ client.on("interactionCreate", async (interaction) => {
         embeds: [
           new EmbedBuilder()
             .setColor(0x7f8c8d)
-            .setTitle("🎰 SPIN — Raté")
-            .setDescription(
-              spinVisual(roll, false) + "\n\nReviens demain pour un nouveau tour 🍀"
-            )
-            .setFooter({
-              text: "Bonus restants: " + remaining + " • 1 spin / jour",
-            })
+            .setTitle("🎰 SPIN — Miss")
+            .setDescription(spinVisual(roll, false) + "\n\nCome back tomorrow 🍀")
+            .setFooter({ text: "Bonus left: " + remaining + " • 1 spin / day" })
             .setTimestamp(),
         ],
       });
     }
 
-    // ─── DICE ──────────────────────────────────────────────
+    // DICE
     if (cmd === "dice") {
       const uid = interaction.user.id;
       const now = Date.now();
@@ -1106,23 +1242,15 @@ client.on("interactionCreate", async (interaction) => {
             new EmbedBuilder()
               .setColor(0xf39c12)
               .setTitle("🎲 DICE — Cooldown")
-              .setDescription(
-                "⏳ Tu as déjà joué aujourd'hui !\n\n" +
-                  "Reviens dans " +
-                  timeLeft(left) +
-                  "."
-              )
-              .setFooter({ text: "1 dice gratuit / jour • LARP TP" })
+              .setDescription("⏳ You already played today!\n\nCome back in " + timeLeft(left) + ".")
+              .setFooter({ text: "1 free dice / day • LARP TP" })
               .setTimestamp(),
           ],
         });
       }
 
-      if (onCooldown && bonus > 0) {
-        consumeBonus(data, "dice", uid);
-      } else {
-        data.dice[uid] = now;
-      }
+      if (onCooldown && bonus > 0) consumeBonus(data, "dice", uid);
+      else data.dice[uid] = now;
 
       const pick = interaction.options.getString("color");
       const pickObj = DICE_COLORS.find((c) => c.value === pick) || DICE_COLORS[0];
@@ -1138,22 +1266,21 @@ client.on("interactionCreate", async (interaction) => {
         const { key, data: kData } = makeKey1h("dice");
         data.keys[key] = kData;
         saveData(data);
+        addLog("dice_win", interaction.user.tag, "", key);
         const dmOk = await sendKeyDM(interaction.user, key, "1h");
         return interaction.editReply({
           embeds: [
             new EmbedBuilder()
               .setColor(0x2ecc71)
-              .setTitle("🎲 DICE — 🎉 GAGNÉ !")
+              .setTitle("🎲 DICE — 🎉 WIN!")
               .setDescription(
                 diceVisual(pickObj.emoji, pick, rolledEmojis, true) +
                   "\n\n" +
                   (dmOk
-                    ? "📩 Clé **1h** envoyée en **MP** !"
-                    : "⚠️ MP fermés — clé: `" + key + "`")
+                    ? "📩 **1h** key sent to your **DMs**!"
+                    : "⚠️ DMs closed — key: `" + key + "`")
               )
-              .setFooter({
-                text: "Bonus restants: " + remaining + " • 1 dice / jour",
-              })
+              .setFooter({ text: "Bonus left: " + remaining + " • 1 dice / day" })
               .setTimestamp(),
           ],
         });
@@ -1164,30 +1291,27 @@ client.on("interactionCreate", async (interaction) => {
         embeds: [
           new EmbedBuilder()
             .setColor(0xe74c3c)
-            .setTitle("🎲 DICE — Perdu")
+            .setTitle("🎲 DICE — Loss")
             .setDescription(diceVisual(pickObj.emoji, pick, rolledEmojis, false))
-            .setFooter({
-              text: "Bonus restants: " + remaining + " • 1 dice / jour",
-            })
+            .setFooter({ text: "Bonus left: " + remaining + " • 1 dice / day" })
             .setTimestamp(),
         ],
       });
     }
 
-    // ─── RESET / GIVE SPIN DICE ────────────────────────────
+    // RESET / GIVE
     if (cmd === "resetspin") {
       const user = interaction.options.getUser("user");
       const all = interaction.options.getBoolean("all");
       if (all) {
         data.spins = {};
         saveData(data);
-        addLog("resetspin", interaction.user.tag, "ALL", "");
         return interaction.editReply({
           embeds: [
             new EmbedBuilder()
               .setColor(0x3498db)
               .setTitle("🔄 Reset Spin")
-              .setDescription("Cooldown **spin** reset pour **tout le monde** ✅"),
+              .setDescription("Spin cooldown reset for **everyone** ✅"),
           ],
         });
       }
@@ -1196,20 +1320,19 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0xe74c3c)
-              .setTitle("❌ Argument manquant")
-              .setDescription("Précise un `user` **ou** mets `all: True`."),
+              .setTitle("❌ Missing argument")
+              .setDescription("Provide a `user` **or** set `all: True`."),
           ],
         });
       }
       delete data.spins[user.id];
       saveData(data);
-      addLog("resetspin", interaction.user.tag, user.tag, "");
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x3498db)
             .setTitle("🔄 Reset Spin")
-            .setDescription("Cooldown **spin** reset pour **" + user.tag + "** ✅"),
+            .setDescription("Spin cooldown reset for **" + user.tag + "** ✅"),
         ],
       });
     }
@@ -1220,13 +1343,12 @@ client.on("interactionCreate", async (interaction) => {
       if (all) {
         data.dice = {};
         saveData(data);
-        addLog("resetdice", interaction.user.tag, "ALL", "");
         return interaction.editReply({
           embeds: [
             new EmbedBuilder()
               .setColor(0x3498db)
               .setTitle("🔄 Reset Dice")
-              .setDescription("Cooldown **dice** reset pour **tout le monde** ✅"),
+              .setDescription("Dice cooldown reset for **everyone** ✅"),
           ],
         });
       }
@@ -1235,20 +1357,19 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0xe74c3c)
-              .setTitle("❌ Argument manquant")
-              .setDescription("Précise un `user` **ou** mets `all: True`."),
+              .setTitle("❌ Missing argument")
+              .setDescription("Provide a `user` **or** set `all: True`."),
           ],
         });
       }
       delete data.dice[user.id];
       saveData(data);
-      addLog("resetdice", interaction.user.tag, user.tag, "");
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x3498db)
             .setTitle("🔄 Reset Dice")
-            .setDescription("Cooldown **dice** reset pour **" + user.tag + "** ✅"),
+            .setDescription("Dice cooldown reset for **" + user.tag + "** ✅"),
         ],
       });
     }
@@ -1258,18 +1379,15 @@ client.on("interactionCreate", async (interaction) => {
       data.spins = {};
       data.globalSpinBonus = (data.globalSpinBonus || 0) + amount;
       saveData(data);
-      addLog("giveallspin", interaction.user.tag, "ALL", String(amount));
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x2ecc71)
             .setTitle("🎁 Give All Spin")
             .setDescription(
-              "✅ Cooldown **spin** reset pour tout le monde\n" +
-                "🎁 **+" +
+              "✅ Spin cooldown reset for everyone\n🎁 **+" +
                 amount +
-                "** spin(s) bonus global(aux)\n\n" +
-                "Tout le monde peut rejouer maintenant !"
+                "** global spin bonus\n\nEveryone can spin again!"
             )
             .setTimestamp(),
         ],
@@ -1281,18 +1399,15 @@ client.on("interactionCreate", async (interaction) => {
       data.dice = {};
       data.globalDiceBonus = (data.globalDiceBonus || 0) + amount;
       saveData(data);
-      addLog("givealldice", interaction.user.tag, "ALL", String(amount));
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x2ecc71)
             .setTitle("🎁 Give All Dice")
             .setDescription(
-              "✅ Cooldown **dice** reset pour tout le monde\n" +
-                "🎁 **+" +
+              "✅ Dice cooldown reset for everyone\n🎁 **+" +
                 amount +
-                "** dice bonus global(aux)\n\n" +
-                "Tout le monde peut rejouer maintenant !"
+                "** global dice bonus\n\nEveryone can play again!"
             )
             .setTimestamp(),
         ],
@@ -1305,15 +1420,12 @@ client.on("interactionCreate", async (interaction) => {
       data.spinsBonus[user.id] = (data.spinsBonus[user.id] || 0) + amount;
       delete data.spins[user.id];
       saveData(data);
-      addLog("givespin", interaction.user.tag, user.tag, String(amount));
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x2ecc71)
-            .setTitle("🎁 Spin donné")
-            .setDescription(
-              "**" + amount + "** spin(s) → **" + user.tag + "**\nCooldown reset ✅"
-            ),
+            .setTitle("🎁 Spins given")
+            .setDescription("**" + amount + "** spin(s) → **" + user.tag + "**\nCooldown reset ✅"),
         ],
       });
     }
@@ -1324,20 +1436,17 @@ client.on("interactionCreate", async (interaction) => {
       data.diceBonus[user.id] = (data.diceBonus[user.id] || 0) + amount;
       delete data.dice[user.id];
       saveData(data);
-      addLog("givedice", interaction.user.tag, user.tag, String(amount));
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x2ecc71)
-            .setTitle("🎁 Dice donné")
-            .setDescription(
-              "**" + amount + "** dice → **" + user.tag + "**\nCooldown reset ✅"
-            ),
+            .setTitle("🎁 Dice given")
+            .setDescription("**" + amount + "** dice → **" + user.tag + "**\nCooldown reset ✅"),
         ],
       });
     }
 
-    // ─── INVITES COMMANDS ──────────────────────────────────
+    // INVITES
     if (cmd === "invites") {
       const uid = interaction.user.id;
       const pts = getInvitePoints(data, uid);
@@ -1346,15 +1455,13 @@ client.on("interactionCreate", async (interaction) => {
         embeds: [
           new EmbedBuilder()
             .setColor(0x9b59b6)
-            .setTitle("🎟️ Tes invites")
+            .setTitle("🎟️ Your invites")
             .setDescription(
-              "Points disponibles: **" +
+              "Available points: **" +
                 pts +
-                "**\n" +
-                "Déjà dépensés: **" +
+                "**\nAlready spent: **" +
                 used +
-                "**\n\n" +
-                "Échange via le **panel** du salon ou les boutons."
+                "**\n\nExchange via the **panel** in the channel."
             )
             .setTimestamp(),
         ],
@@ -1362,7 +1469,6 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (cmd === "invitepanel") {
-      // Message public (pas ephemeral) qui reste dans le salon
       try {
         await interaction.deleteReply().catch(() => {});
       } catch (_) {}
@@ -1370,14 +1476,9 @@ client.on("interactionCreate", async (interaction) => {
         embeds: [buildInvitePanelEmbed()],
         components: [buildInvitePanelButtons()],
       });
-      // confirmation éphémère si possible
       try {
-        await interaction.followUp({
-          content: "✅ Panel invites posté dans ce salon.",
-          ephemeral: true,
-        });
+        await interaction.followUp({ content: "✅ Invite panel posted.", ephemeral: true });
       } catch (_) {}
-      addLog("invitepanel", interaction.user.tag, interaction.channelId, "");
       return;
     }
 
@@ -1386,12 +1487,12 @@ client.on("interactionCreate", async (interaction) => {
       const amount = interaction.options.getInteger("amount");
       addInvitePoints(data, user.id, amount);
       saveData(data);
-      addLog("addinvites", interaction.user.tag, user.tag, String(amount));
+      addLog("addinvites", interaction.user.tag, user.tag, "+" + amount);
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x2ecc71)
-            .setTitle("➕ Invites ajoutées")
+            .setTitle("➕ Invites added")
             .setDescription(
               "**+" +
                 amount +
@@ -1410,19 +1511,188 @@ client.on("interactionCreate", async (interaction) => {
       const amount = interaction.options.getInteger("amount");
       data.invites[user.id] = amount;
       saveData(data);
-      addLog("setinvites", interaction.user.tag, user.tag, String(amount));
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x3498db)
-            .setTitle("✏️ Invites définies")
+            .setTitle("✏️ Invites set")
             .setDescription("**" + user.tag + "** → **" + amount + "** point(s)"),
         ],
       });
     }
 
+    // KEYDROP
+    if (cmd === "keydrop") {
+      const durationStr = interaction.options.getString("duration");
+      const amount = interaction.options.getInteger("amount");
+      const parsed = parseDuration(durationStr);
+      if (!parsed || parsed.lifetime) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Invalid duration")
+              .setDescription("Use timed durations only: `30m`, `1h`, `1d` (no lifetime)."),
+          ],
+        });
+      }
+
+      const baseDesc =
+        "A keydrop is live!\n\n" +
+        "⏱️ Duration per key: **" +
+        durationStr +
+        "**\n" +
+        "🔑 Total keys: **" +
+        amount +
+        "**\n\n" +
+        "Click **Claim key** — one claim per person.\nKeys are sent in **DM**.";
+
+      const embed = new EmbedBuilder()
+        .setColor(0xf1c40f)
+        .setTitle("🎁 KEYDROP!")
+        .setDescription(baseDesc + "\n\n**Remaining:** `" + amount + "` / `" + amount + "`")
+        .setFooter({ text: "LARP TP • Keydrop" })
+        .setTimestamp();
+
+      try {
+        await interaction.deleteReply().catch(() => {});
+      } catch (_) {}
+
+      const msg = await interaction.channel.send({
+        embeds: [embed],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId("keydrop_claim_PENDING")
+              .setLabel("Claim key")
+              .setEmoji("🔑")
+              .setStyle(ButtonStyle.Success)
+          ),
+        ],
+      });
+
+      // Fix button customId with real message id
+      await msg.edit({
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId("keydrop_claim_" + msg.id)
+              .setLabel("Claim key")
+              .setEmoji("🔑")
+              .setStyle(ButtonStyle.Success)
+          ),
+        ],
+      });
+
+      activeDrops.set(msg.id, {
+        keysLeft: amount,
+        total: amount,
+        duration: durationStr,
+        claimed: new Set(),
+        baseDesc,
+        embedData: embed.toJSON(),
+      });
+
+      addLog("keydrop", interaction.user.tag, "", amount + "x " + durationStr);
+      try {
+        await interaction.followUp({
+          content: "✅ Keydrop posted (" + amount + "× " + durationStr + ").",
+          ephemeral: true,
+        });
+      } catch (_) {}
+      return;
+    }
+
+    // LOGS
+    if (cmd === "logs") {
+      const limit = interaction.options.getInteger("limit") || 15;
+      const type = interaction.options.getString("type") || "all";
+      let logs = [...(data.logs || [])].reverse();
+      if (type === "redeem") logs = logs.filter((l) => l.action === "redeem");
+      else if (type === "tp") logs = logs.filter((l) => l.action === "tp");
+      else if (type === "keydrop") logs = logs.filter((l) => l.action === "keydrop");
+      else if (type === "games")
+        logs = logs.filter((l) => l.action === "spin_win" || l.action === "dice_win");
+      else if (type === "invite")
+        logs = logs.filter((l) => String(l.action).includes("invite"));
+
+      logs = logs.slice(0, limit);
+      if (!logs.length) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x95a5a6)
+              .setTitle("📋 Logs")
+              .setDescription("No logs found."),
+          ],
+        });
+      }
+      const lines = logs.map((l) => {
+        const t = (l.at || "").replace("T", " ").slice(0, 19);
+        return (
+          "`" +
+          t +
+          "` **" +
+          l.action +
+          "** — " +
+          (l.by || "?") +
+          (l.target ? " → " + l.target : "") +
+          (l.details ? " _(" + l.details + ")_" : "")
+        );
+      });
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x00e5ff)
+            .setTitle("📋 Recent logs")
+            .setDescription(lines.join("\n").slice(0, 4000))
+            .setFooter({ text: "Filter: " + type })
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    if (cmd === "tplogs") {
+      const limit = interaction.options.getInteger("limit") || 15;
+      const logs = [...(data.tpLogs || [])].reverse().slice(0, limit);
+      if (!logs.length) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x95a5a6)
+              .setTitle("📍 TP Logs")
+              .setDescription(
+                "No TP logs yet.\n\nYour game should POST to `/api/log/tp` with the API secret."
+              ),
+          ],
+        });
+      }
+      const lines = logs.map((l) => {
+        const t = (l.at || "").replace("T", " ").slice(0, 19);
+        return (
+          "`" +
+          t +
+          "` **" +
+          (l.username || "?") +
+          "**" +
+          (l.from ? " from `" + l.from + "`" : "") +
+          (l.to ? " → `" + l.to + "`" : "") +
+          (l.details ? " _(" + l.details + ")_" : "")
+        );
+      });
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x3498db)
+            .setTitle("📍 Recent TP logs")
+            .setDescription(lines.join("\n").slice(0, 4000))
+            .setTimestamp(),
+        ],
+      });
+    }
+
     return interaction.editReply({
-      embeds: [new EmbedBuilder().setColor(0x95a5a6).setTitle("❓ Commande inconnue")],
+      embeds: [new EmbedBuilder().setColor(0x95a5a6).setTitle("❓ Unknown command")],
     });
   } catch (err) {
     console.error("[ERR]", cmd, err);
@@ -1431,7 +1701,7 @@ client.on("interactionCreate", async (interaction) => {
         embeds: [
           new EmbedBuilder()
             .setColor(0xe74c3c)
-            .setTitle("❌ Erreur")
+            .setTitle("❌ Error")
             .setDescription("`" + (err.message || "server") + "`"),
         ],
       });
@@ -1442,7 +1712,7 @@ client.on("interactionCreate", async (interaction) => {
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
   await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-  console.log("[BOT] Commandes enregistrées.");
+  console.log("[BOT] Commands registered.");
 }
 
 const app = express();
@@ -1487,6 +1757,39 @@ app.post("/api/keys/use", checkSecret, (req, res) => {
   data.keys[key].robloxUsername = username;
   data.keys[key].usedAt = new Date().toISOString();
   saveData(data);
+  addLog("redeem", username, username, "API use " + key);
+  res.json({ ok: true });
+});
+
+// In-game TP log endpoint
+app.post("/api/log/tp", checkSecret, (req, res) => {
+  const body = req.body || {};
+  const username = String(body.username || body.player || "unknown");
+  const from = String(body.from || body.fromPlace || "");
+  const to = String(body.to || body.toPlace || body.destination || "");
+  const details = String(body.details || body.reason || "");
+  const data = loadData();
+  data.tpLogs = data.tpLogs || [];
+  data.tpLogs.push({
+    at: new Date().toISOString(),
+    username,
+    from,
+    to,
+    details,
+  });
+  saveData(data);
+  addLog("tp", username, to || from, details || (from + " → " + to));
+  res.json({ ok: true });
+});
+
+// Generic activity log from game
+app.post("/api/log", checkSecret, (req, res) => {
+  const body = req.body || {};
+  const action = String(body.action || "game");
+  const by = String(body.by || body.username || "unknown");
+  const target = String(body.target || "");
+  const details = String(body.details || "");
+  addLog(action, by, target, details);
   res.json({ ok: true });
 });
 
