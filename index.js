@@ -11,7 +11,6 @@ const cors = require("cors");
 const {
   Client,
   GatewayIntentBits,
-  Partials,
   EmbedBuilder,
   SlashCommandBuilder,
   REST,
@@ -52,9 +51,6 @@ const DICE_COLORS = [
   { name: "Orange", emoji: "🟠", value: "Orange", color: 0xe67e22 },
   { name: "Violet", emoji: "🟣", value: "Violet", color: 0x9b59b6 },
 ];
-
-// Cache invites Discord (code → uses)
-const invitesCache = new Map();
 
 function loadData() {
   for (const file of [DATA_FILE, LOCAL_FALLBACK]) {
@@ -196,6 +192,33 @@ function makeKey1h(source) {
   return makeKey("1h", 3600, source);
 }
 
+/** Envoie la clé en MP à l'utilisateur. Retourne true si OK. */
+async function sendKeyDM(user, key, durationStr) {
+  try {
+    await user.send({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x00e5ff)
+          .setTitle("🔑 Ta clé LARP TP")
+          .setDescription(
+            "Voici ta clé :\n\n🔑 `" +
+              key +
+              "`\n⏱️ Durée: **" +
+              durationStr +
+              "**\n\n" +
+              "➡️ En jeu: **My Key → Redeem**\n" +
+              "➡️ Ou `/redeem` sur Discord"
+          )
+          .setFooter({ text: "LARP TP" })
+          .setTimestamp(),
+      ],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function getBonus(data, type, uid) {
   if (type === "spin") {
     return (data.spinsBonus[uid] || 0) + (data.globalSpinBonus || 0);
@@ -284,12 +307,13 @@ function buildInvitePanelEmbed() {
     .setColor(0x9b59b6)
     .setTitle("🎟️ Panel Invites — LARP TP")
     .setDescription(
-      "Invite des potes sur le serveur et **échange tes invites** contre des récompenses !\n\n" +
+      "Échange tes **points d'invites** contre des récompenses !\n\n" +
         "**Taux d'échange :**\n" +
-        "• `1` invite → 🔑 clé **1h**\n" +
+        "• `1` invite → 🔑 clé **1h** *(envoyée en MP)*\n" +
         "• `1` invite → 🎰 **2 spins**\n" +
-        "• `5` invites → 🔑 clé **1 jour**\n\n" +
-        "⚠️ Chaque invite ne peut être **dépensée qu'une seule fois**.\n" +
+        "• `5` invites → 🔑 clé **1 jour** *(envoyée en MP)*\n\n" +
+        "⚠️ Chaque point ne peut être **dépensé qu'une seule fois**.\n" +
+        "Les admins attribuent les points avec `/addinvites`.\n" +
         "Clique sur un bouton ci-dessous pour échanger."
     )
     .setFooter({ text: "LARP TP • Invites" })
@@ -452,131 +476,19 @@ const commands = [
     ),
 ].map((c) => c.toJSON());
 
+// GuildMembers retiré → compatible Bot-Hosting (pas d'intent privilégié)
+// Les points d'invites se donnent avec /addinvites (admin)
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildInvites,
-  ],
-  partials: [Partials.GuildMember],
+  intents: [GatewayIntentBits.Guilds],
 });
 
-async function cacheGuildInvites(guild) {
-  try {
-    const invites = await guild.invites.fetch();
-    const map = new Map();
-    invites.forEach((inv) => map.set(inv.code, inv.uses || 0));
-    invitesCache.set(guild.id, map);
-    console.log("[INVITES] Cache chargé:", map.size, "invites pour", guild.name);
-  } catch (e) {
-    console.warn("[INVITES] Impossible de charger les invites:", e.message);
-  }
-}
-
-client.once("clientReady", async () => {
+client.once("clientReady", () => {
   console.log("[BOT] Connecté:", client.user.tag);
   console.log("[BOT] Admins Discord IDs:", BOT_ADMINS.join(", ") || "(aucun)");
-  for (const [, guild] of client.guilds.cache) {
-    await cacheGuildInvites(guild);
-  }
 });
-client.once("ready", async () => {
+client.once("ready", () => {
   console.log("[BOT] Connecté (ready):", client.user.tag);
   console.log("[BOT] Admins Discord IDs:", BOT_ADMINS.join(", ") || "(aucun)");
-  for (const [, guild] of client.guilds.cache) {
-    await cacheGuildInvites(guild);
-  }
-});
-
-// Quand quelqu'un rejoint → détecter qui a invité
-client.on("guildMemberAdd", async (member) => {
-  try {
-    const cached = invitesCache.get(member.guild.id) || new Map();
-    let usedInvite = null;
-    try {
-      const newInvites = await member.guild.invites.fetch();
-      for (const [code, inv] of newInvites) {
-        const prev = cached.get(code) || 0;
-        if ((inv.uses || 0) > prev) {
-          usedInvite = inv;
-          break;
-        }
-      }
-      // maj cache
-      const map = new Map();
-      newInvites.forEach((inv) => map.set(inv.code, inv.uses || 0));
-      invitesCache.set(member.guild.id, map);
-    } catch (e) {
-      console.warn("[INVITES] fetch after join:", e.message);
-      return;
-    }
-
-    if (!usedInvite || !usedInvite.inviter) return;
-
-    const inviterId = usedInvite.inviter.id;
-    if (inviterId === member.id) return; // self-invite
-
-    const data = loadData();
-    data.invitedUsers = data.invitedUsers || {};
-    data.invites = data.invites || {};
-
-    // Déjà compté pour ce membre → ignore (anti double)
-    if (data.invitedUsers[member.id]) {
-      console.log("[INVITES] Déjà compté pour", member.user.tag);
-      return;
-    }
-
-    data.invitedUsers[member.id] = inviterId;
-    addInvitePoints(data, inviterId, 1);
-    saveData(data);
-    addLog("invite", usedInvite.inviter.tag, member.user.tag, "+1");
-
-    console.log(
-      "[INVITES] +1 pour",
-      usedInvite.inviter.tag,
-      "(a invité",
-      member.user.tag + ")"
-    );
-
-    // MP optionnel à l'inviteur
-    try {
-      await usedInvite.inviter.send({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0x9b59b6)
-            .setTitle("🎟️ +1 Invite !")
-            .setDescription(
-              "**" +
-                member.user.tag +
-                "** a rejoint grâce à ton lien.\n" +
-                "Tu as maintenant **" +
-                getInvitePoints(data, inviterId) +
-                "** point(s).\n\n" +
-                "Échange-les via le **panel invites** du serveur."
-            )
-            .setTimestamp(),
-        ],
-      });
-    } catch (_) {}
-  } catch (err) {
-    console.error("[INVITES] guildMemberAdd", err);
-  }
-});
-
-// Quand une invite est créée → maj cache
-client.on("inviteCreate", async (invite) => {
-  try {
-    const map = invitesCache.get(invite.guild.id) || new Map();
-    map.set(invite.code, invite.uses || 0);
-    invitesCache.set(invite.guild.id, map);
-  } catch (_) {}
-});
-
-client.on("inviteDelete", async (invite) => {
-  try {
-    const map = invitesCache.get(invite.guild.id);
-    if (map) map.delete(invite.code);
-  } catch (_) {}
 });
 
 client.on("interactionCreate", async (interaction) => {
@@ -640,15 +552,17 @@ client.on("interactionCreate", async (interaction) => {
       data.keys[key] = kData;
       saveData(data);
       addLog("inv_claim_1h", interaction.user.tag, "", key);
+      const dmOk = await sendKeyDM(interaction.user, key, "1h");
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x2ecc71)
             .setTitle("✅ Clé 1h obtenue !")
             .setDescription(
-              "🎟️ -1 invite\n\n🔑 `" +
-                key +
-                "`\n\nUtilise `/redeem` ou **My Key** en jeu."
+              "🎟️ -1 invite\n\n" +
+                (dmOk
+                  ? "📩 Clé envoyée en **MP** !"
+                  : "⚠️ MP fermés — clé: `" + key + "`")
             )
             .setFooter({ text: "Restant: " + getInvitePoints(data, uid) + " invite(s)" })
             .setTimestamp(),
@@ -704,15 +618,17 @@ client.on("interactionCreate", async (interaction) => {
       data.keys[key] = kData;
       saveData(data);
       addLog("inv_claim_1d", interaction.user.tag, "", key);
+      const dmOk = await sendKeyDM(interaction.user, key, "1d");
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setColor(0x2ecc71)
             .setTitle("✅ Clé 1 jour obtenue !")
             .setDescription(
-              "🎟️ -5 invites\n\n💎 `" +
-                key +
-                "`\n\nUtilise `/redeem` ou **My Key** en jeu."
+              "🎟️ -5 invites\n\n" +
+                (dmOk
+                  ? "📩 Clé envoyée en **MP** !"
+                  : "⚠️ MP fermés — clé: `" + key + "`")
             )
             .setFooter({ text: "Restant: " + getInvitePoints(data, uid) + " invite(s)" })
             .setTimestamp(),
@@ -1137,6 +1053,7 @@ client.on("interactionCreate", async (interaction) => {
         const { key, data: kData } = makeKey1h("spin");
         data.keys[key] = kData;
         saveData(data);
+        const dmOk = await sendKeyDM(interaction.user, key, "1h");
         return interaction.editReply({
           embeds: [
             new EmbedBuilder()
@@ -1144,9 +1061,10 @@ client.on("interactionCreate", async (interaction) => {
               .setTitle("🎰 SPIN — 🎉 GAGNÉ !")
               .setDescription(
                 spinVisual(roll, true) +
-                  "\n\n🔑 Ta clé **1h** :\n`" +
-                  key +
-                  "`\n\n➡️ `/redeem` ou **My Key** en jeu"
+                  "\n\n" +
+                  (dmOk
+                    ? "📩 Clé **1h** envoyée en **MP** !"
+                    : "⚠️ MP fermés — clé: `" + key + "`")
               )
               .setFooter({
                 text: "Bonus restants: " + remaining + " • 1 spin / jour",
@@ -1220,6 +1138,7 @@ client.on("interactionCreate", async (interaction) => {
         const { key, data: kData } = makeKey1h("dice");
         data.keys[key] = kData;
         saveData(data);
+        const dmOk = await sendKeyDM(interaction.user, key, "1h");
         return interaction.editReply({
           embeds: [
             new EmbedBuilder()
@@ -1227,9 +1146,10 @@ client.on("interactionCreate", async (interaction) => {
               .setTitle("🎲 DICE — 🎉 GAGNÉ !")
               .setDescription(
                 diceVisual(pickObj.emoji, pick, rolledEmojis, true) +
-                  "\n\n🔑 Ta clé **1h** :\n`" +
-                  key +
-                  "`\n\n➡️ `/redeem` ou **My Key** en jeu"
+                  "\n\n" +
+                  (dmOk
+                    ? "📩 Clé **1h** envoyée en **MP** !"
+                    : "⚠️ MP fermés — clé: `" + key + "`")
               )
               .setFooter({
                 text: "Bonus restants: " + remaining + " • 1 dice / jour",
