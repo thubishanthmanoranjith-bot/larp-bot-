@@ -26,10 +26,21 @@ const BOT_ADMINS = (process.env.BOT_ADMINS || "")
   .map((id) => id.trim())
   .filter(Boolean);
 
-// Dossier writable (Render free)
 const DATA_DIR = process.env.DATA_DIR || "/tmp";
 const DATA_FILE = path.join(DATA_DIR, "larp-data.json");
 const LOCAL_FALLBACK = path.join(__dirname, "data.json");
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// ─── Couleurs dice ─────────────────────────────────────────
+const DICE_COLORS = [
+  { name: "Red", emoji: "🔴", value: "Red", color: 0xe74c3c },
+  { name: "Blue", emoji: "🔵", value: "Blue", color: 0x3498db },
+  { name: "Green", emoji: "🟢", value: "Green", color: 0x2ecc71 },
+  { name: "Yellow", emoji: "🟡", value: "Yellow", color: 0xf1c40f },
+  { name: "Orange", emoji: "🟠", value: "Orange", color: 0xe67e22 },
+  { name: "Violet", emoji: "🟣", value: "Violet", color: 0x9b59b6 },
+];
 
 function loadData() {
   for (const file of [DATA_FILE, LOCAL_FALLBACK]) {
@@ -44,6 +55,10 @@ function loadData() {
         d.logs = d.logs || [];
         d.spins = d.spins || {};
         d.dice = d.dice || {};
+        d.spinsBonus = d.spinsBonus || {};
+        d.diceBonus = d.diceBonus || {};
+        d.globalSpinBonus = d.globalSpinBonus || 0;
+        d.globalDiceBonus = d.globalDiceBonus || 0;
         return d;
       }
     } catch (e) {
@@ -57,6 +72,12 @@ function loadData() {
     lifetimeWhitelist: {},
     keys: {},
     logs: [],
+    spins: {},
+    dice: {},
+    spinsBonus: {},
+    diceBonus: {},
+    globalSpinBonus: 0,
+    globalDiceBonus: 0,
   };
 }
 
@@ -126,81 +147,219 @@ function applyAccess(data, username, parsed) {
   else data.whitelist[key] = Math.floor(Date.now() / 1000) + parsed.seconds;
 }
 
+function timeLeft(ms) {
+  if (ms <= 0) return "maintenant";
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  if (h > 0) return `~**${h}h ${m}m**`;
+  return `~**${m}m**`;
+}
+
+function makeKey1h(source) {
+  const key = generateKey();
+  return {
+    key,
+    data: {
+      duration: "1h",
+      lifetime: false,
+      seconds: 3600,
+      durationSeconds: 3600,
+      used: false,
+      usedBy: null,
+      createdBy: source,
+      createdAt: new Date().toISOString(),
+    },
+  };
+}
+
+function getBonus(data, type, uid) {
+  if (type === "spin") {
+    return (data.spinsBonus[uid] || 0) + (data.globalSpinBonus || 0);
+  }
+  return (data.diceBonus[uid] || 0) + (data.globalDiceBonus || 0);
+}
+
+function consumeBonus(data, type, uid) {
+  if (type === "spin") {
+    if ((data.spinsBonus[uid] || 0) > 0) {
+      data.spinsBonus[uid] -= 1;
+      return;
+    }
+    if ((data.globalSpinBonus || 0) > 0) data.globalSpinBonus -= 1;
+  } else {
+    if ((data.diceBonus[uid] || 0) > 0) {
+      data.diceBonus[uid] -= 1;
+      return;
+    }
+    if ((data.globalDiceBonus || 0) > 0) data.globalDiceBonus -= 1;
+  }
+}
+
+// Animation visuelle pour le spin
+function spinVisual(roll, win) {
+  const bars = ["▱", "▰"];
+  const fill = Math.min(10, Math.floor(roll / 10));
+  const bar = "▰".repeat(fill) + "▱".repeat(10 - fill);
+  return (
+    "```\n" +
+    "  🎰  LARP SPIN  🎰\n" +
+    "  ┌──────────────┐\n" +
+    "  │  " +
+    bar +
+    "  │\n" +
+    "  │    " +
+    String(roll).padStart(3, " ") +
+    " / 100    │\n" +
+    "  └──────────────┘\n" +
+    "```\n" +
+    (win ? "✨ **JACKPOT** ✨" : "💨 *rien cette fois...*")
+  );
+}
+
+// Animation visuelle pour le dice (4 couleurs tirées)
+function diceVisual(pickEmoji, pick, rolledEmojis, match) {
+  const line = rolledEmojis.join("  ");
+  return (
+    "```\n" +
+    "  🎲  LARP DICE  🎲\n" +
+    "  ┌──────────────────┐\n" +
+    "  │  " +
+    line +
+    "  │\n" +
+    "  └──────────────────┘\n" +
+    "```\n" +
+    "Tu as choisi " +
+    pickEmoji +
+    " **" +
+    pick +
+    "**\n" +
+    "Les 4 couleurs : " +
+    line +
+    "\n\n" +
+    (match
+      ? "🎉🎊 **TA COULEUR EST SORTIE !** Tu gagnes une clé **1h** 🔑"
+      : "💔 Ta couleur n'est pas sortie... retente demain !")
+  );
+}
+
 const commands = [
   new SlashCommandBuilder()
     .setName("createkey")
-    .setDescription("Creer une cle LARP TP")
+    .setDescription("🔑 Créer une clé LARP TP")
     .addStringOption((o) =>
       o.setName("duration").setDescription("30m / 1h / 1d / lifetime").setRequired(true)
     )
     .addIntegerOption((o) =>
-      o.setName("amount").setDescription("Nombre de cles (1-20)").setMinValue(1).setMaxValue(20)
+      o.setName("amount").setDescription("Nombre de clés (1-20)").setMinValue(1).setMaxValue(20)
     ),
   new SlashCommandBuilder()
     .setName("givekey")
-    .setDescription("Creer une cle et lenvoyer en MP")
+    .setDescription("🎁 Créer une clé et l'envoyer en MP")
     .addUserOption((o) => o.setName("user").setDescription("Membre").setRequired(true))
     .addStringOption((o) =>
       o.setName("duration").setDescription("30m / 1h / 1d / lifetime").setRequired(true)
     ),
   new SlashCommandBuilder()
     .setName("redeem")
-    .setDescription("Utiliser une cle")
-    .addStringOption((o) => o.setName("key").setDescription("Cle LARP-XXXX").setRequired(true))
+    .setDescription("✅ Utiliser une clé")
+    .addStringOption((o) => o.setName("key").setDescription("Clé LARP-XXXX").setRequired(true))
     .addStringOption((o) =>
       o.setName("username").setDescription("Pseudo Roblox").setRequired(true)
     ),
   new SlashCommandBuilder()
     .setName("checkkey")
-    .setDescription("Verifier une cle")
-    .addStringOption((o) => o.setName("key").setDescription("Cle").setRequired(true)),
+    .setDescription("🔍 Vérifier une clé")
+    .addStringOption((o) => o.setName("key").setDescription("Clé").setRequired(true)),
   new SlashCommandBuilder()
     .setName("add")
-    .setDescription("Whitelist sans cle")
+    .setDescription("➕ Whitelist sans clé")
     .addStringOption((o) => o.setName("username").setDescription("Pseudo Roblox").setRequired(true))
     .addStringOption((o) =>
       o.setName("duration").setDescription("1h / lifetime").setRequired(true)
     ),
   new SlashCommandBuilder()
     .setName("remove")
-    .setDescription("Retirer whitelist")
+    .setDescription("➖ Retirer whitelist")
     .addStringOption((o) => o.setName("username").setDescription("Pseudo Roblox").setRequired(true)),
   new SlashCommandBuilder()
     .setName("info")
-    .setDescription("Info joueur")
+    .setDescription("👤 Info joueur")
     .addStringOption((o) => o.setName("username").setDescription("Pseudo Roblox").setRequired(true)),
-  new SlashCommandBuilder().setName("list").setDescription("Liste whitelist"),
+  new SlashCommandBuilder().setName("list").setDescription("📋 Liste whitelist"),
   new SlashCommandBuilder()
     .setName("spin")
-    .setDescription("Tour quotidien — chance de gagner une cle 1h (1 fois / jour)"),
+    .setDescription("🎰 Tour quotidien — chance de gagner une clé 1h (1× / jour)"),
   new SlashCommandBuilder()
     .setName("dice")
-    .setDescription("Choisis une couleur — si ca match, tu gagnes une cle 1h")
+    .setDescription("🎲 Choisis 1 couleur — 4 sortent au hasard, si la tienne apparaît = clé 1h (1×/jour)")
     .addStringOption((o) =>
       o
         .setName("color")
         .setDescription("Ta couleur")
         .setRequired(true)
         .addChoices(
-          { name: "Red", value: "Red" },
-          { name: "Orange", value: "Orange" },
-          { name: "Yellow", value: "Yellow" },
-          { name: "Green", value: "Green" },
-          { name: "Blue", value: "Blue" },
-          { name: "Purple", value: "Purple" }
+          { name: "🔴 Red", value: "Red" },
+          { name: "🔵 Blue", value: "Blue" },
+          { name: "🟢 Green", value: "Green" },
+          { name: "🟡 Yellow", value: "Yellow" },
+          { name: "🟠 Orange", value: "Orange" },
+          { name: "🟣 Violet", value: "Violet" }
         )
+    ),
+  new SlashCommandBuilder()
+    .setName("resetspin")
+    .setDescription("🔄 Reset le cooldown spin (user ou all)")
+    .addUserOption((o) => o.setName("user").setDescription("Membre"))
+    .addBooleanOption((o) => o.setName("all").setDescription("Reset tout le monde")),
+  new SlashCommandBuilder()
+    .setName("resetdice")
+    .setDescription("🔄 Reset le cooldown dice (user ou all)")
+    .addUserOption((o) => o.setName("user").setDescription("Membre"))
+    .addBooleanOption((o) => o.setName("all").setDescription("Reset tout le monde")),
+  new SlashCommandBuilder()
+    .setName("giveallspin")
+    .setDescription("🎁 Reset cooldown + bonus spin pour tout le monde")
+    .addIntegerOption((o) =>
+      o
+        .setName("amount")
+        .setDescription("Bonus globaux (défaut 1)")
+        .setMinValue(1)
+        .setMaxValue(10)
+    ),
+  new SlashCommandBuilder()
+    .setName("givealldice")
+    .setDescription("🎁 Reset cooldown + bonus dice pour tout le monde")
+    .addIntegerOption((o) =>
+      o
+        .setName("amount")
+        .setDescription("Bonus globaux (défaut 1)")
+        .setMinValue(1)
+        .setMaxValue(10)
+    ),
+  new SlashCommandBuilder()
+    .setName("givespin")
+    .setDescription("🎁 Donne des spins à un user")
+    .addUserOption((o) => o.setName("user").setDescription("Membre").setRequired(true))
+    .addIntegerOption((o) =>
+      o.setName("amount").setDescription("Nombre (défaut 1)").setMinValue(1).setMaxValue(20)
+    ),
+  new SlashCommandBuilder()
+    .setName("givedice")
+    .setDescription("🎁 Donne des dice à un user")
+    .addUserOption((o) => o.setName("user").setDescription("Membre").setRequired(true))
+    .addIntegerOption((o) =>
+      o.setName("amount").setDescription("Nombre (défaut 1)").setMinValue(1).setMaxValue(20)
     ),
 ].map((c) => c.toJSON());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 client.once("clientReady", () => {
-  console.log("[BOT] Connecte:", client.user.tag);
+  console.log("[BOT] Connecté:", client.user.tag);
   console.log("[BOT] Admins Discord IDs:", BOT_ADMINS.join(", ") || "(aucun)");
 });
-// compat anciennes versions discord.js
 client.once("ready", () => {
-  console.log("[BOT] Connecte (ready):", client.user.tag);
+  console.log("[BOT] Connecté (ready):", client.user.tag);
   console.log("[BOT] Admins Discord IDs:", BOT_ADMINS.join(", ") || "(aucun)");
 });
 
@@ -210,7 +369,6 @@ client.on("interactionCreate", async (interaction) => {
   const cmd = interaction.commandName;
   console.log("[CMD]", cmd, "by", interaction.user.id, interaction.user.tag);
 
-  // Repondre vite pour eviter "application ne repond plus"
   try {
     await interaction.deferReply({ ephemeral: true });
   } catch (e) {
@@ -223,22 +381,43 @@ client.on("interactionCreate", async (interaction) => {
 
   if (needsAdmin && !isBotAdmin(interaction.user.id)) {
     return interaction.editReply({
-      content:
-        "Permission refusee. Ton ID: `" +
-        interaction.user.id +
-        "` — ajoute-le dans BOT_ADMINS sur Render.",
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0xe74c3c)
+          .setTitle("⛔ Accès refusé")
+          .setDescription(
+            "Tu n'as pas la permission.\nTon ID: `" +
+              interaction.user.id +
+              "`\nAjoute-le dans **BOT_ADMINS** sur Render."
+          )
+          .setTimestamp(),
+      ],
     });
   }
 
   try {
     const data = loadData();
+    data.spins = data.spins || {};
+    data.dice = data.dice || {};
+    data.spinsBonus = data.spinsBonus || {};
+    data.diceBonus = data.diceBonus || {};
+    data.globalSpinBonus = data.globalSpinBonus || 0;
+    data.globalDiceBonus = data.globalDiceBonus || 0;
 
+    // ─── CREATEKEY ─────────────────────────────────────────
     if (cmd === "createkey") {
       const durationStr = interaction.options.getString("duration");
       const amount = interaction.options.getInteger("amount") || 1;
       const parsed = parseDuration(durationStr);
       if (!parsed) {
-        return interaction.editReply({ content: "Duree invalide. Ex: 30m, 1h, 1d, lifetime" });
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Durée invalide")
+              .setDescription("Exemples: `30m` · `1h` · `1d` · `lifetime`"),
+          ],
+        });
       }
       const created = [];
       for (let i = 0; i < amount; i++) {
@@ -263,18 +442,34 @@ client.on("interactionCreate", async (interaction) => {
         embeds: [
           new EmbedBuilder()
             .setColor(0x00e5ff)
-            .setTitle(amount + " cle(s) creee(s)")
-            .setDescription(created.map((k) => "`" + k + "`").join("\n") + "\n\nDuree: **" + durationStr + "**")
+            .setTitle("🔑 " + amount + " clé(s) créée(s)")
+            .setDescription(
+              created.map((k) => "🔑 `" + k + "`").join("\n") +
+                "\n\n⏱️ Durée: **" +
+                durationStr +
+                "**"
+            )
+            .setFooter({ text: "LARP TP • Keys" })
             .setTimestamp(),
         ],
       });
     }
 
+    // ─── GIVEKEY ───────────────────────────────────────────
     if (cmd === "givekey") {
       const user = interaction.options.getUser("user");
       const durationStr = interaction.options.getString("duration");
       const parsed = parseDuration(durationStr);
-      if (!parsed) return interaction.editReply({ content: "Duree invalide." });
+      if (!parsed) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Durée invalide")
+              .setDescription("Exemples: `30m` · `1h` · `1d` · `lifetime`"),
+          ],
+        });
+      }
       const key = generateKey();
       data.keys[key] = {
         duration: durationStr,
@@ -293,44 +488,90 @@ client.on("interactionCreate", async (interaction) => {
           embeds: [
             new EmbedBuilder()
               .setColor(0x00e5ff)
-              .setTitle("Cle LARP TP")
+              .setTitle("🎁 Clé LARP TP")
               .setDescription(
-                "`" +
+                "Tu as reçu une clé !\n\n🔑 `" +
                   key +
-                  "`\nDuree: **" +
+                  "`\n⏱️ Durée: **" +
                   durationStr +
-                  "**\n\nEn jeu: My Key → Redeem\nOu `/redeem`"
-              ),
+                  "**\n\n" +
+                  "➡️ En jeu: **My Key → Redeem**\n" +
+                  "➡️ Ou utilise `/redeem`"
+              )
+              .setFooter({ text: "LARP TP" })
+              .setTimestamp(),
           ],
         });
-        return interaction.editReply({ content: "Cle envoyee en MP a **" + user.tag + "**." });
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x2ecc71)
+              .setTitle("✅ Clé envoyée")
+              .setDescription("MP envoyé à **" + user.tag + "** 🎉"),
+          ],
+        });
       } catch {
         return interaction.editReply({
-          content: "MP impossible. Cle: `" + key + "`",
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("⚠️ MP impossible")
+              .setDescription("Clé: `" + key + "`\nDonne-la manuellement."),
+          ],
         });
       }
     }
 
+    // ─── REDEEM ────────────────────────────────────────────
     if (cmd === "redeem") {
       const keyInput = interaction.options.getString("key").trim().toUpperCase();
       const username = interaction.options.getString("username").trim();
       const keyData = data.keys[keyInput];
       if (!keyData) {
-        return interaction.editReply({ content: "Cle invalide." });
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Clé invalide")
+              .setDescription("Cette clé n'existe pas."),
+          ],
+        });
       }
       if (keyData.used) {
         return interaction.editReply({
-          content: "Cle deja utilisee" + (keyData.robloxUsername ? " par **" + keyData.robloxUsername + "**." : "."),
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("🔒 Clé déjà utilisée")
+              .setDescription(
+                keyData.robloxUsername
+                  ? "Utilisée par **" + keyData.robloxUsername + "**"
+                  : "Cette clé a déjà été consommée."
+              ),
+          ],
         });
       }
       const uname = username.toLowerCase();
-      // pas de cumul
       if (data.lifetimeWhitelist[uname]) {
-        return interaction.editReply({ content: "Ce compte a deja lifetime. Pas de cumul." });
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Pas de cumul")
+              .setDescription("Ce compte a déjà **lifetime** ♾️"),
+          ],
+        });
       }
       const now = Math.floor(Date.now() / 1000);
       if (data.whitelist[uname] && data.whitelist[uname] > now) {
-        return interaction.editReply({ content: "Ce compte a deja du temps. Pas de cumul." });
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Pas de cumul")
+              .setDescription("Ce compte a déjà du temps restant."),
+          ],
+        });
       }
       applyAccess(data, username, {
         lifetime: keyData.lifetime,
@@ -342,183 +583,517 @@ client.on("interactionCreate", async (interaction) => {
       keyData.robloxUsername = uname;
       saveData(data);
       return interaction.editReply({
-        content:
-          "Cle acceptee pour **" +
-          username +
-          "** — " +
-          (keyData.lifetime ? "LIFETIME" : keyData.duration),
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("✅ Clé acceptée !")
+            .setDescription(
+              "👤 Joueur: **" +
+                username +
+                "**\n" +
+                "⏱️ Accès: **" +
+                (keyData.lifetime ? "LIFETIME ♾️" : keyData.duration) +
+                "**"
+            )
+            .setFooter({ text: "LARP TP • Redeem" })
+            .setTimestamp(),
+        ],
       });
     }
 
+    // ─── CHECKKEY ──────────────────────────────────────────
     if (cmd === "checkkey") {
       const keyInput = interaction.options.getString("key").trim().toUpperCase();
       const keyData = data.keys[keyInput];
-      if (!keyData) return interaction.editReply({ content: "Cle introuvable." });
-      if (keyData.used) {
+      if (!keyData) {
         return interaction.editReply({
-          content: "Deja utilisee — " + (keyData.robloxUsername || keyData.usedBy || "?"),
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Introuvable")
+              .setDescription("Cette clé n'existe pas."),
+          ],
         });
       }
-      return interaction.editReply({ content: "Valide — duree **" + keyData.duration + "**" });
+      if (keyData.used) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x95a5a6)
+              .setTitle("🔒 Déjà utilisée")
+              .setDescription(
+                "Par: **" + (keyData.robloxUsername || keyData.usedBy || "?") + "**"
+              ),
+          ],
+        });
+      }
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("✅ Clé valide")
+            .setDescription("⏱️ Durée: **" + keyData.duration + "**"),
+        ],
+      });
     }
 
+    // ─── ADD ───────────────────────────────────────────────
     if (cmd === "add") {
       const username = interaction.options.getString("username").toLowerCase();
       const durationStr = interaction.options.getString("duration");
       const parsed = parseDuration(durationStr);
-      if (!parsed) return interaction.editReply({ content: "Duree invalide." });
+      if (!parsed) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Durée invalide")
+              .setDescription("Exemples: `1h` · `lifetime`"),
+          ],
+        });
+      }
       applyAccess(data, username, parsed);
       saveData(data);
-      return interaction.editReply({ content: "**" + username + "** → **" + durationStr + "**" });
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("➕ Whitelist ajoutée")
+            .setDescription("👤 **" + username + "** → ⏱️ **" + durationStr + "**"),
+        ],
+      });
     }
 
+    // ─── REMOVE ────────────────────────────────────────────
     if (cmd === "remove") {
       const username = interaction.options.getString("username").toLowerCase();
       delete data.whitelist[username];
       delete data.pausedWhitelist[username];
       delete data.lifetimeWhitelist[username];
       saveData(data);
-      return interaction.editReply({ content: "**" + username + "** retire." });
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe74c3c)
+            .setTitle("➖ Retiré")
+            .setDescription("👤 **" + username + "** n'a plus d'accès."),
+        ],
+      });
     }
 
+    // ─── INFO ──────────────────────────────────────────────
     if (cmd === "info") {
       const username = interaction.options.getString("username").toLowerCase();
       const now = Math.floor(Date.now() / 1000);
-      let status = "Aucun acces";
-      if (data.admins.includes(username)) status = "ADMIN";
-      else if (data.lifetimeWhitelist[username]) status = "LIFETIME";
-      else if (data.whitelist[username] && data.whitelist[username] > now)
-        status = "WHITELIST (" + Math.floor((data.whitelist[username] - now) / 60) + "m)";
-      return interaction.editReply({ content: "**" + username + "** — " + status });
+      let status = "❌ Aucun accès";
+      let color = 0x95a5a6;
+      if (data.admins.includes(username)) {
+        status = "👑 **ADMIN**";
+        color = 0xf1c40f;
+      } else if (data.lifetimeWhitelist[username]) {
+        status = "♾️ **LIFETIME**";
+        color = 0x9b59b6;
+      } else if (data.whitelist[username] && data.whitelist[username] > now) {
+        const mins = Math.floor((data.whitelist[username] - now) / 60);
+        status = "🟢 **WHITELIST** — " + mins + " min restantes";
+        color = 0x2ecc71;
+      }
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(color)
+            .setTitle("👤 Info joueur")
+            .setDescription("**" + username + "**\n" + status)
+            .setTimestamp(),
+        ],
+      });
     }
 
+    // ─── LIST ──────────────────────────────────────────────
     if (cmd === "list") {
       const now = Math.floor(Date.now() / 1000);
-      const life = Object.keys(data.lifetimeWhitelist).join(", ") || "aucun";
+      const life = Object.keys(data.lifetimeWhitelist);
       const active = [];
       for (const [n, exp] of Object.entries(data.whitelist)) {
         if (exp > now) active.push(n);
       }
       return interaction.editReply({
-        content: "Lifetime: " + life + "\nActifs: " + (active.join(", ") || "aucun"),
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x00e5ff)
+            .setTitle("📋 Whitelist LARP TP")
+            .addFields(
+              {
+                name: "♾️ Lifetime (" + life.length + ")",
+                value: life.length ? life.map((n) => "• " + n).join("\n") : "_aucun_",
+                inline: false,
+              },
+              {
+                name: "🟢 Actifs (" + active.length + ")",
+                value: active.length ? active.map((n) => "• " + n).join("\n") : "_aucun_",
+                inline: false,
+              }
+            )
+            .setFooter({ text: "LARP TP" })
+            .setTimestamp(),
+        ],
       });
     }
 
-
+    // ─── SPIN ──────────────────────────────────────────────
     if (cmd === "spin") {
       const uid = interaction.user.id;
-      data.spins = data.spins || {};
       const now = Date.now();
       const last = data.spins[uid] || 0;
-      const dayMs = 24 * 60 * 60 * 1000;
-      if (now - last < dayMs) {
-        const left = dayMs - (now - last);
-        const h = Math.ceil(left / 3600000);
-        return interaction.editReply({
-          content: "Deja utilise aujourd hui. Reviens dans ~**" + h + "h**.",
-        });
-      }
-      data.spins[uid] = now;
-      // 15% chance de gagner une cle 1h
-      const win = Math.random() < 0.15;
-      const roll = Math.floor(Math.random() * 100) + 1;
-      if (win) {
-        const key = generateKey();
-        data.keys[key] = {
-          duration: "1h",
-          lifetime: false,
-          seconds: 3600,
-          durationSeconds: 3600,
-          used: false,
-          usedBy: null,
-          createdBy: "spin",
-          createdAt: new Date().toISOString(),
-        };
-        saveData(data);
+      const bonus = getBonus(data, "spin", uid);
+      const onCooldown = now - last < DAY_MS;
+
+      if (onCooldown && bonus <= 0) {
+        const left = DAY_MS - (now - last);
         return interaction.editReply({
           embeds: [
             new EmbedBuilder()
-              .setColor(0x50e6a0)
-              .setTitle("SPIN — GAGNE")
+              .setColor(0xf39c12)
+              .setTitle("🎰 SPIN — Cooldown")
               .setDescription(
-                "Roulement... **" +
-                  roll +
-                  "**/100\n\nTu gagnes une cle **1h** :\n`" +
-                  key +
-                  "`\n\nUtilise `/redeem` ou My Key en jeu."
+                "⏳ Tu as déjà tourné aujourd'hui !\n\n" +
+                  "Reviens dans " +
+                  timeLeft(left) +
+                  "."
               )
+              .setFooter({ text: "1 spin gratuit / jour • LARP TP" })
               .setTimestamp(),
           ],
         });
       }
+
+      if (onCooldown && bonus > 0) {
+        consumeBonus(data, "spin", uid);
+      } else {
+        data.spins[uid] = now;
+      }
+
+      const win = Math.random() < 0.15;
+      const roll = Math.floor(Math.random() * 100) + 1;
+      const remaining = getBonus(data, "spin", uid);
+
+      if (win) {
+        const { key, data: kData } = makeKey1h("spin");
+        data.keys[key] = kData;
+        saveData(data);
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x2ecc71)
+              .setTitle("🎰 SPIN — 🎉 GAGNÉ !")
+              .setDescription(
+                spinVisual(roll, true) +
+                  "\n\n🔑 Ta clé **1h** :\n`" +
+                  key +
+                  "`\n\n➡️ `/redeem` ou **My Key** en jeu"
+              )
+              .setFooter({
+                text: "Bonus restants: " + remaining + " • 1 spin / jour",
+              })
+              .setTimestamp(),
+          ],
+        });
+      }
+
       saveData(data);
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
-            .setColor(0x555570)
-            .setTitle("SPIN — rate")
+            .setColor(0x7f8c8d)
+            .setTitle("🎰 SPIN — Raté")
             .setDescription(
-              "Roulement... **" +
-                roll +
-                "**/100\n\nPas de cle cette fois. Reviens demain (1 tour / jour)."
+              spinVisual(roll, false) + "\n\nReviens demain pour un nouveau tour 🍀"
+            )
+            .setFooter({
+              text: "Bonus restants: " + remaining + " • 1 spin / jour",
+            })
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    // ─── DICE (4 couleurs, 1×/jour) ────────────────────────
+    if (cmd === "dice") {
+      const uid = interaction.user.id;
+      const now = Date.now();
+      const last = data.dice[uid] || 0;
+      const bonus = getBonus(data, "dice", uid);
+      const onCooldown = now - last < DAY_MS;
+
+      if (onCooldown && bonus <= 0) {
+        const left = DAY_MS - (now - last);
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("🎲 DICE — Cooldown")
+              .setDescription(
+                "⏳ Tu as déjà joué aujourd'hui !\n\n" +
+                  "Reviens dans " +
+                  timeLeft(left) +
+                  "."
+              )
+              .setFooter({ text: "1 dice gratuit / jour • LARP TP" })
+              .setTimestamp(),
+          ],
+        });
+      }
+
+      if (onCooldown && bonus > 0) {
+        consumeBonus(data, "dice", uid);
+      } else {
+        data.dice[uid] = now;
+      }
+
+      const pick = interaction.options.getString("color");
+      const pickObj = DICE_COLORS.find((c) => c.value === pick) || DICE_COLORS[0];
+
+      // Tire 4 couleurs au hasard (avec remise possible)
+      const rolled = [];
+      for (let i = 0; i < 4; i++) {
+        rolled.push(DICE_COLORS[Math.floor(Math.random() * DICE_COLORS.length)]);
+      }
+      const rolledEmojis = rolled.map((c) => c.emoji);
+      const match = rolled.some((c) => c.value === pick);
+      const remaining = getBonus(data, "dice", uid);
+
+      if (match) {
+        const { key, data: kData } = makeKey1h("dice");
+        data.keys[key] = kData;
+        saveData(data);
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x2ecc71)
+              .setTitle("🎲 DICE — 🎉 GAGNÉ !")
+              .setDescription(
+                diceVisual(pickObj.emoji, pick, rolledEmojis, true) +
+                  "\n\n🔑 Ta clé **1h** :\n`" +
+                  key +
+                  "`\n\n➡️ `/redeem` ou **My Key** en jeu"
+              )
+              .setFooter({
+                text: "Bonus restants: " + remaining + " • 1 dice / jour",
+              })
+              .setTimestamp(),
+          ],
+        });
+      }
+
+      saveData(data);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe74c3c)
+            .setTitle("🎲 DICE — Perdu")
+            .setDescription(diceVisual(pickObj.emoji, pick, rolledEmojis, false))
+            .setFooter({
+              text: "Bonus restants: " + remaining + " • 1 dice / jour",
+            })
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    // ─── RESETSPIN ─────────────────────────────────────────
+    if (cmd === "resetspin") {
+      const user = interaction.options.getUser("user");
+      const all = interaction.options.getBoolean("all");
+      if (all) {
+        data.spins = {};
+        saveData(data);
+        addLog("resetspin", interaction.user.tag, "ALL", "");
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x3498db)
+              .setTitle("🔄 Reset Spin")
+              .setDescription("Cooldown **spin** reset pour **tout le monde** ✅"),
+          ],
+        });
+      }
+      if (!user) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Argument manquant")
+              .setDescription("Précise un `user` **ou** mets `all: True`."),
+          ],
+        });
+      }
+      delete data.spins[user.id];
+      saveData(data);
+      addLog("resetspin", interaction.user.tag, user.tag, "");
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x3498db)
+            .setTitle("🔄 Reset Spin")
+            .setDescription("Cooldown **spin** reset pour **" + user.tag + "** ✅"),
+        ],
+      });
+    }
+
+    // ─── RESETDICE ─────────────────────────────────────────
+    if (cmd === "resetdice") {
+      const user = interaction.options.getUser("user");
+      const all = interaction.options.getBoolean("all");
+      if (all) {
+        data.dice = {};
+        saveData(data);
+        addLog("resetdice", interaction.user.tag, "ALL", "");
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x3498db)
+              .setTitle("🔄 Reset Dice")
+              .setDescription("Cooldown **dice** reset pour **tout le monde** ✅"),
+          ],
+        });
+      }
+      if (!user) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Argument manquant")
+              .setDescription("Précise un `user` **ou** mets `all: True`."),
+          ],
+        });
+      }
+      delete data.dice[user.id];
+      saveData(data);
+      addLog("resetdice", interaction.user.tag, user.tag, "");
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x3498db)
+            .setTitle("🔄 Reset Dice")
+            .setDescription("Cooldown **dice** reset pour **" + user.tag + "** ✅"),
+        ],
+      });
+    }
+
+    // ─── GIVEALLSPIN ───────────────────────────────────────
+    if (cmd === "giveallspin") {
+      const amount = interaction.options.getInteger("amount") || 1;
+      data.spins = {};
+      data.globalSpinBonus = (data.globalSpinBonus || 0) + amount;
+      saveData(data);
+      addLog("giveallspin", interaction.user.tag, "ALL", String(amount));
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("🎁 Give All Spin")
+            .setDescription(
+              "✅ Cooldown **spin** reset pour tout le monde\n" +
+                "🎁 **+" +
+                amount +
+                "** spin(s) bonus global(aux)\n\n" +
+                "Tout le monde peut rejouer maintenant !"
             )
             .setTimestamp(),
         ],
       });
     }
 
-    if (cmd === "dice") {
-      const COLORS = ["Red", "Orange", "Yellow", "Green", "Blue", "Purple"];
-      const pick = interaction.options.getString("color");
-      const rolled = COLORS[Math.floor(Math.random() * COLORS.length)];
-      const match = pick === rolled;
-      let msg =
-        "Tu as choisi **" +
-        pick +
-        "**\nLe de affiche **" +
-        rolled +
-        "**\n\n";
-      if (match) {
-        const key = generateKey();
-        data.keys[key] = {
-          duration: "1h",
-          lifetime: false,
-          seconds: 3600,
-          durationSeconds: 3600,
-          used: false,
-          usedBy: null,
-          createdBy: "dice",
-          createdAt: new Date().toISOString(),
-        };
-        saveData(data);
-        msg += "Match ! Cle **1h** :\n`" + key + "`";
-        return interaction.editReply({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0x50e6a0)
-              .setTitle("DICE — GAGNE")
-              .setDescription(msg)
-              .setTimestamp(),
-          ],
-        });
-      }
-      msg += "Pas de match. Retente plus tard.";
+    // ─── GIVEALLDICE ───────────────────────────────────────
+    if (cmd === "givealldice") {
+      const amount = interaction.options.getInteger("amount") || 1;
+      data.dice = {};
+      data.globalDiceBonus = (data.globalDiceBonus || 0) + amount;
+      saveData(data);
+      addLog("givealldice", interaction.user.tag, "ALL", String(amount));
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
-            .setColor(0xee6767)
-            .setTitle("DICE — perdu")
-            .setDescription(msg)
+            .setColor(0x2ecc71)
+            .setTitle("🎁 Give All Dice")
+            .setDescription(
+              "✅ Cooldown **dice** reset pour tout le monde\n" +
+                "🎁 **+" +
+                amount +
+                "** dice bonus global(aux)\n\n" +
+                "Tout le monde peut rejouer maintenant !"
+            )
             .setTimestamp(),
         ],
       });
     }
 
-    return interaction.editReply({ content: "Commande inconnue." });
+    // ─── GIVESPIN ──────────────────────────────────────────
+    if (cmd === "givespin") {
+      const user = interaction.options.getUser("user");
+      const amount = interaction.options.getInteger("amount") || 1;
+      data.spinsBonus[user.id] = (data.spinsBonus[user.id] || 0) + amount;
+      delete data.spins[user.id];
+      saveData(data);
+      addLog("givespin", interaction.user.tag, user.tag, String(amount));
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("🎁 Spin donné")
+            .setDescription(
+              "**" +
+                amount +
+                "** spin(s) → **" +
+                user.tag +
+                "**\nCooldown reset ✅"
+            ),
+        ],
+      });
+    }
+
+    // ─── GIVEDICE ──────────────────────────────────────────
+    if (cmd === "givedice") {
+      const user = interaction.options.getUser("user");
+      const amount = interaction.options.getInteger("amount") || 1;
+      data.diceBonus[user.id] = (data.diceBonus[user.id] || 0) + amount;
+      delete data.dice[user.id];
+      saveData(data);
+      addLog("givedice", interaction.user.tag, user.tag, String(amount));
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("🎁 Dice donné")
+            .setDescription(
+              "**" +
+                amount +
+                "** dice → **" +
+                user.tag +
+                "**\nCooldown reset ✅"
+            ),
+        ],
+      });
+    }
+
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x95a5a6)
+          .setTitle("❓ Commande inconnue"),
+      ],
+    });
   } catch (err) {
     console.error("[ERR]", cmd, err);
     try {
-      await interaction.editReply({ content: "Erreur: " + (err.message || "server") });
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe74c3c)
+            .setTitle("❌ Erreur")
+            .setDescription("`" + (err.message || "server") + "`"),
+        ],
+      });
     } catch (_) {}
   }
 });
@@ -526,7 +1101,7 @@ client.on("interactionCreate", async (interaction) => {
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
   await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-  console.log("[BOT] Commandes enregistrees.");
+  console.log("[BOT] Commandes enregistrées.");
 }
 
 const app = express();
