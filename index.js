@@ -42,6 +42,8 @@ function loadData() {
         d.pausedWhitelist = d.pausedWhitelist || {};
         d.lifetimeWhitelist = d.lifetimeWhitelist || {};
         d.logs = d.logs || [];
+        d.spins = d.spins || {};
+        d.dice = d.dice || {};
         return d;
       }
     } catch (e) {
@@ -168,6 +170,26 @@ const commands = [
     .setDescription("Info joueur")
     .addStringOption((o) => o.setName("username").setDescription("Pseudo Roblox").setRequired(true)),
   new SlashCommandBuilder().setName("list").setDescription("Liste whitelist"),
+  new SlashCommandBuilder()
+    .setName("spin")
+    .setDescription("Tour quotidien — chance de gagner une cle 1h (1 fois / jour)"),
+  new SlashCommandBuilder()
+    .setName("dice")
+    .setDescription("Choisis une couleur — si ca match, tu gagnes une cle 1h")
+    .addStringOption((o) =>
+      o
+        .setName("color")
+        .setDescription("Ta couleur")
+        .setRequired(true)
+        .addChoices(
+          { name: "Red", value: "Red" },
+          { name: "Orange", value: "Orange" },
+          { name: "Yellow", value: "Yellow" },
+          { name: "Green", value: "Green" },
+          { name: "Blue", value: "Blue" },
+          { name: "Purple", value: "Purple" }
+        )
+    ),
 ].map((c) => c.toJSON());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -196,7 +218,7 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
-  const publicCmds = ["redeem", "checkkey", "info"];
+  const publicCmds = ["redeem", "checkkey", "info", "spin", "dice"];
   const needsAdmin = !publicCmds.includes(cmd);
 
   if (needsAdmin && !isBotAdmin(interaction.user.id)) {
@@ -379,6 +401,116 @@ client.on("interactionCreate", async (interaction) => {
       }
       return interaction.editReply({
         content: "Lifetime: " + life + "\nActifs: " + (active.join(", ") || "aucun"),
+      });
+    }
+
+
+    if (cmd === "spin") {
+      const uid = interaction.user.id;
+      data.spins = data.spins || {};
+      const now = Date.now();
+      const last = data.spins[uid] || 0;
+      const dayMs = 24 * 60 * 60 * 1000;
+      if (now - last < dayMs) {
+        const left = dayMs - (now - last);
+        const h = Math.ceil(left / 3600000);
+        return interaction.editReply({
+          content: "Deja utilise aujourd hui. Reviens dans ~**" + h + "h**.",
+        });
+      }
+      data.spins[uid] = now;
+      // 15% chance de gagner une cle 1h
+      const win = Math.random() < 0.15;
+      const roll = Math.floor(Math.random() * 100) + 1;
+      if (win) {
+        const key = generateKey();
+        data.keys[key] = {
+          duration: "1h",
+          lifetime: false,
+          seconds: 3600,
+          durationSeconds: 3600,
+          used: false,
+          usedBy: null,
+          createdBy: "spin",
+          createdAt: new Date().toISOString(),
+        };
+        saveData(data);
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x50e6a0)
+              .setTitle("SPIN — GAGNE")
+              .setDescription(
+                "Roulement... **" +
+                  roll +
+                  "**/100\n\nTu gagnes une cle **1h** :\n`" +
+                  key +
+                  "`\n\nUtilise `/redeem` ou My Key en jeu."
+              )
+              .setTimestamp(),
+          ],
+        });
+      }
+      saveData(data);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x555570)
+            .setTitle("SPIN — rate")
+            .setDescription(
+              "Roulement... **" +
+                roll +
+                "**/100\n\nPas de cle cette fois. Reviens demain (1 tour / jour)."
+            )
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    if (cmd === "dice") {
+      const COLORS = ["Red", "Orange", "Yellow", "Green", "Blue", "Purple"];
+      const pick = interaction.options.getString("color");
+      const rolled = COLORS[Math.floor(Math.random() * COLORS.length)];
+      const match = pick === rolled;
+      let msg =
+        "Tu as choisi **" +
+        pick +
+        "**\nLe de affiche **" +
+        rolled +
+        "**\n\n";
+      if (match) {
+        const key = generateKey();
+        data.keys[key] = {
+          duration: "1h",
+          lifetime: false,
+          seconds: 3600,
+          durationSeconds: 3600,
+          used: false,
+          usedBy: null,
+          createdBy: "dice",
+          createdAt: new Date().toISOString(),
+        };
+        saveData(data);
+        msg += "Match ! Cle **1h** :\n`" + key + "`";
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x50e6a0)
+              .setTitle("DICE — GAGNE")
+              .setDescription(msg)
+              .setTimestamp(),
+          ],
+        });
+      }
+      msg += "Pas de match. Retente plus tard.";
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xee6767)
+            .setTitle("DICE — perdu")
+            .setDescription(msg)
+            .setTimestamp(),
+        ],
       });
     }
 
