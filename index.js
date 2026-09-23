@@ -680,7 +680,11 @@ const commands = [
 ].map((c) => c.toJSON());
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent, // needed to read number guesses in chat
+  ],
 });
 
 client.once("clientReady", () => {
@@ -690,6 +694,116 @@ client.once("clientReady", () => {
 client.once("ready", () => {
   console.log("[BOT] Connected (ready):", client.user.tag);
   console.log("[BOT] Admin IDs:", BOT_ADMINS.join(", ") || "(none)");
+});
+
+// Guess the number via chat: just type the number (no slash command needed)
+client.on("messageCreate", async (message) => {
+  try {
+    if (message.author.bot || !message.guild) return;
+    const content = (message.content || "").trim();
+    if (!/^\d+$/.test(content)) return;
+
+    const guildId = message.guild.id;
+    const game = guessGames.get(guildId);
+    if (!game || !game.active) return;
+    if (game.channelId && message.channel.id !== game.channelId) return;
+
+    const n = parseInt(content, 10);
+    if (Number.isNaN(n)) return;
+
+    if (n < game.min || n > game.max) {
+      await message
+        .reply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setDescription(
+                "⚠️ Out of range — guess between **" +
+                  game.min +
+                  "** and **" +
+                  game.max +
+                  "**."
+              ),
+          ],
+        })
+        .catch(() => {});
+      return;
+    }
+
+    game.guesses += 1;
+    game.tried.add(message.author.id);
+
+    if (n === game.number) {
+      game.active = false;
+      guessGames.delete(guildId);
+      addLog(
+        "guess_win",
+        message.author.tag,
+        "",
+        "number " + n + " in " + game.guesses + " guesses (chat)"
+      );
+
+      let rewardMsg = "";
+      if (game.reward) {
+        const data = loadData();
+        const { key, data: kData } = makeKey1h("guess");
+        data.keys[key] = kData;
+        saveData(data);
+        const dmOk = await sendKeyDM(message.author, key, "1h");
+        rewardMsg = dmOk
+          ? "\n\n🎁 **1h key** sent to your **DMs**!"
+          : "\n\n⚠️ DMs closed — key: `" + key + "`";
+      }
+
+      await message
+        .reply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x2ecc71)
+              .setTitle("🎉 CORRECT!")
+              .setDescription(
+                "**" +
+                  message.author.tag +
+                  "** found the number **" +
+                  n +
+                  "**!\n" +
+                  "Total guesses: **" +
+                  game.guesses +
+                  "**" +
+                  rewardMsg
+              )
+              .setTimestamp(),
+          ],
+        })
+        .catch(() => {});
+      return;
+    }
+
+    const hint = n < game.number ? "📈 **Higher!**" : "📉 **Lower!**";
+    await message
+      .reply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe67e22)
+            .setDescription(
+              "🎯 **" +
+                n +
+                "** — " +
+                hint +
+                "\nGuesses: **" +
+                game.guesses +
+                "** · Range **" +
+                game.min +
+                "–" +
+                game.max +
+                "**"
+            ),
+        ],
+      })
+      .catch(() => {});
+  } catch (err) {
+    console.error("[guess chat]", err);
+  }
 });
 
 client.on("interactionCreate", async (interaction) => {
@@ -1812,7 +1926,7 @@ client.on("interactionCreate", async (interaction) => {
                 max +
                 "**\n" +
                 (reward ? "🎁 Winner gets a **1h key** (DM)\n" : "") +
-                "\nUse `/guess number:<your number>` to play!"
+                "\nJust **type a number** in this chat to guess!\n(You can still use `/guess` too)"
             )
             .setFooter({ text: "Started by " + interaction.user.tag })
             .setTimestamp(),
