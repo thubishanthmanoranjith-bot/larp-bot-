@@ -55,6 +55,12 @@ const DICE_COLORS = [
 // Active keydrops: messageId → { keysLeft, duration, claimed: Set }
 const activeDrops = new Map();
 
+// Guess the number: guildId → game state
+const guessGames = new Map();
+
+// Raffle: guildId → { prize, entrants: Set, messageId, active }
+const activeRaffles = new Map();
+
 function loadData() {
   for (const file of [DATA_FILE, LOCAL_FALLBACK]) {
     try {
@@ -76,6 +82,10 @@ function loadData() {
         d.invitesUsed = d.invitesUsed || {};
         d.invitedUsers = d.invitedUsers || {};
         d.tpLogs = d.tpLogs || [];
+        d.stats = d.stats || {}; // userId -> { spinWins, diceWins, redeems, codes }
+        d.streaks = d.streaks || {}; // userId -> { count, lastDay }
+        d.codes = d.codes || {}; // CODE -> { duration, maxUses, uses, reward, expiresAt }
+        d.blacklist = d.blacklist || {}; // robloxUsername -> { reason, by, at }
         return d;
       }
     } catch (e) {
@@ -99,7 +109,21 @@ function loadData() {
     invitesUsed: {},
     invitedUsers: {},
     tpLogs: [],
+    stats: {},
+    streaks: {},
+    codes: {},
+    blacklist: {},
   };
+}
+
+function bumpStat(data, userId, field, n) {
+  data.stats = data.stats || {};
+  if (!data.stats[userId]) data.stats[userId] = { spinWins: 0, diceWins: 0, redeems: 0, codes: 0 };
+  data.stats[userId][field] = (data.stats[userId][field] || 0) + (n || 1);
+}
+
+function dayKey() {
+  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
 }
 
 function saveData(data) {
@@ -500,6 +524,39 @@ const commands = [
     .addIntegerOption((o) =>
       o.setName("amount").setDescription("New total").setRequired(true).setMinValue(0).setMaxValue(999)
     ),
+  // GUESS THE NUMBER
+  new SlashCommandBuilder()
+    .setName("guessstart")
+    .setDescription("🎯 Start Guess the Number (you pick the secret number)")
+    .addIntegerOption((o) =>
+      o
+        .setName("number")
+        .setDescription("The secret number players must find")
+        .setRequired(true)
+        .setMinValue(0)
+        .setMaxValue(1000000)
+    )
+    .addIntegerOption((o) =>
+      o.setName("min").setDescription("Min range shown to players (default 1)").setMinValue(0)
+    )
+    .addIntegerOption((o) =>
+      o.setName("max").setDescription("Max range shown to players (default 100)").setMinValue(1)
+    )
+    .addBooleanOption((o) =>
+      o.setName("reward").setDescription("Give a 1h key to the winner? (default true)")
+    ),
+  new SlashCommandBuilder()
+    .setName("guess")
+    .setDescription("🎯 Guess the secret number")
+    .addIntegerOption((o) =>
+      o.setName("number").setDescription("Your guess").setRequired(true).setMinValue(0).setMaxValue(1000000)
+    ),
+  new SlashCommandBuilder()
+    .setName("guessend")
+    .setDescription("🛑 End the current Guess the Number game"),
+  new SlashCommandBuilder()
+    .setName("guessinfo")
+    .setDescription("ℹ️ Info about the current Guess the Number game"),
   // KEYDROP
   new SlashCommandBuilder()
     .setName("keydrop")
@@ -541,6 +598,85 @@ const commands = [
     .addIntegerOption((o) =>
       o.setName("limit").setDescription("How many (default 15)").setMinValue(5).setMaxValue(30)
     ),
+  // LEADERBOARD
+  new SlashCommandBuilder()
+    .setName("leaderboard")
+    .setDescription("🏆 Leaderboard")
+    .addStringOption((o) =>
+      o
+        .setName("type")
+        .setDescription("Category")
+        .setRequired(true)
+        .addChoices(
+          { name: "Invites", value: "invites" },
+          { name: "Spin wins", value: "spins" },
+          { name: "Dice wins", value: "dice" },
+          { name: "Redeems", value: "redeems" }
+        )
+    ),
+  // DAILY STREAK
+  new SlashCommandBuilder()
+    .setName("daily")
+    .setDescription("📅 Claim your daily streak reward"),
+  new SlashCommandBuilder()
+    .setName("streak")
+    .setDescription("🔥 Check your daily streak"),
+  // PROMO CODES
+  new SlashCommandBuilder()
+    .setName("createcode")
+    .setDescription("🏷️ Create a promo code (admin)")
+    .addStringOption((o) => o.setName("code").setDescription("Code text").setRequired(true))
+    .addStringOption((o) =>
+      o.setName("duration").setDescription("Key duration e.g. 1h / 1d").setRequired(true)
+    )
+    .addIntegerOption((o) =>
+      o.setName("maxuses").setDescription("Max redemptions (default 1)").setMinValue(1).setMaxValue(500)
+    )
+    .addIntegerOption((o) =>
+      o.setName("hours").setDescription("Code expires after X hours (0 = never)").setMinValue(0).setMaxValue(720)
+    ),
+  new SlashCommandBuilder()
+    .setName("code")
+    .setDescription("🏷️ Redeem a promo code")
+    .addStringOption((o) => o.setName("code").setDescription("The code").setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("listcodes")
+    .setDescription("🏷️ List active promo codes (admin)"),
+  new SlashCommandBuilder()
+    .setName("deletecode")
+    .setDescription("🗑️ Delete a promo code (admin)")
+    .addStringOption((o) => o.setName("code").setDescription("Code to delete").setRequired(true)),
+  // BLACKLIST
+  new SlashCommandBuilder()
+    .setName("blacklist")
+    .setDescription("🚫 Blacklist a Roblox username (admin)")
+    .addStringOption((o) => o.setName("username").setDescription("Roblox username").setRequired(true))
+    .addStringOption((o) => o.setName("reason").setDescription("Reason")),
+  new SlashCommandBuilder()
+    .setName("unblacklist")
+    .setDescription("✅ Remove from blacklist (admin)")
+    .addStringOption((o) => o.setName("username").setDescription("Roblox username").setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("blacklistcheck")
+    .setDescription("🔍 Check if a Roblox user is blacklisted")
+    .addStringOption((o) => o.setName("username").setDescription("Roblox username").setRequired(true)),
+  // EXPIRATION
+  new SlashCommandBuilder()
+    .setName("checkexpires")
+    .setDescription("⏰ List whitelist entries expiring soon (admin)")
+    .addIntegerOption((o) =>
+      o.setName("hours").setDescription("Within how many hours (default 24)").setMinValue(1).setMaxValue(168)
+    ),
+  // RAFFLE
+  new SlashCommandBuilder()
+    .setName("raffle")
+    .setDescription("🎊 Start a raffle (admin)")
+    .addStringOption((o) =>
+      o.setName("prize").setDescription("Prize description e.g. 1h key").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("raffleend")
+    .setDescription("🎊 Draw raffle winner (admin)"),
 ].map((c) => c.toJSON());
 
 const client = new Client({
@@ -661,6 +797,52 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     // Invite buttons
+    // Raffle join
+    if (id === "raffle_join") {
+      try {
+        await interaction.deferReply({ ephemeral: true });
+      } catch {
+        return;
+      }
+      const guildId = interaction.guildId || "dm";
+      const raffle = activeRaffles.get(guildId);
+      if (!raffle || !raffle.active) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ No active raffle")
+              .setDescription("This raffle has ended."),
+          ],
+        });
+      }
+      if (raffle.entrants.has(interaction.user.id)) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("⚠️ Already joined")
+              .setDescription("You are already in this raffle."),
+          ],
+        });
+      }
+      raffle.entrants.add(interaction.user.id);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("✅ Joined raffle!")
+            .setDescription(
+              "Prize: **" +
+                raffle.prize +
+                "**\nEntrants: **" +
+                raffle.entrants.size +
+                "**"
+            ),
+        ],
+      });
+    }
+
     if (!id.startsWith("inv_")) return;
 
     try {
@@ -809,7 +991,21 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
-  const publicCmds = ["redeem", "checkkey", "info", "spin", "dice", "invites"];
+  const publicCmds = [
+    "redeem",
+    "checkkey",
+    "info",
+    "spin",
+    "dice",
+    "invites",
+    "guess",
+    "guessinfo",
+    "leaderboard",
+    "daily",
+    "streak",
+    "code",
+    "blacklistcheck",
+  ];
   const needsAdmin = !publicCmds.includes(cmd);
 
   if (needsAdmin && !isBotAdmin(interaction.user.id)) {
@@ -970,6 +1166,22 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
       const uname = username.toLowerCase();
+      data.blacklist = data.blacklist || {};
+      if (data.blacklist[uname]) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("🚫 Blacklisted")
+              .setDescription(
+                "**" +
+                  username +
+                  "** is blacklisted.\nReason: " +
+                  (data.blacklist[uname].reason || "—")
+              ),
+          ],
+        });
+      }
       if (data.lifetimeWhitelist[uname]) {
         return interaction.editReply({
           embeds: [
@@ -999,6 +1211,7 @@ client.on("interactionCreate", async (interaction) => {
       keyData.usedBy = interaction.user.tag;
       keyData.usedAt = new Date().toISOString();
       keyData.robloxUsername = uname;
+      bumpStat(data, interaction.user.id, "redeems");
       saveData(data);
       addLog(
         "redeem",
@@ -1194,6 +1407,7 @@ client.on("interactionCreate", async (interaction) => {
         const { key, data: kData } = makeKey1h("spin");
         data.keys[key] = kData;
         saveData(data);
+        bumpStat(data, interaction.user.id, "spinWins");
         addLog("spin_win", interaction.user.tag, "", key);
         const dmOk = await sendKeyDM(interaction.user, key, "1h");
         return interaction.editReply({
@@ -1266,6 +1480,7 @@ client.on("interactionCreate", async (interaction) => {
         const { key, data: kData } = makeKey1h("dice");
         data.keys[key] = kData;
         saveData(data);
+        bumpStat(data, interaction.user.id, "diceWins");
         addLog("dice_win", interaction.user.tag, "", key);
         const dmOk = await sendKeyDM(interaction.user, key, "1h");
         return interaction.editReply({
@@ -1521,6 +1736,286 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
+    // ─── GUESS THE NUMBER ───────────────────────────────────
+    if (cmd === "guessstart") {
+      const guildId = interaction.guildId || "dm";
+      if (guessGames.has(guildId) && guessGames.get(guildId).active) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("⚠️ Game already running")
+              .setDescription(
+                "A Guess the Number game is already active.\nUse `/guessend` first."
+              ),
+          ],
+        });
+      }
+      const number = interaction.options.getInteger("number");
+      let min = interaction.options.getInteger("min");
+      let max = interaction.options.getInteger("max");
+      if (min == null) min = 1;
+      if (max == null) max = 100;
+      if (min > max) {
+        const t = min;
+        min = max;
+        max = t;
+      }
+      if (number < min || number > max) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Number out of range")
+              .setDescription(
+                "Secret number **" +
+                  number +
+                  "** must be between **" +
+                  min +
+                  "** and **" +
+                  max +
+                  "**."
+              ),
+          ],
+        });
+      }
+      const rewardOpt = interaction.options.getBoolean("reward");
+      const reward = rewardOpt === null ? true : rewardOpt;
+
+      guessGames.set(guildId, {
+        active: true,
+        number,
+        min,
+        max,
+        reward,
+        startedBy: interaction.user.tag,
+        startedById: interaction.user.id,
+        guesses: 0,
+        tried: new Set(),
+        channelId: interaction.channelId,
+      });
+
+      // Public announcement
+      try {
+        await interaction.deleteReply().catch(() => {});
+      } catch (_) {}
+      await interaction.channel.send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe67e22)
+            .setTitle("🎯 GUESS THE NUMBER!")
+            .setDescription(
+              "A new game has started!\n\n" +
+                "🔢 Range: **" +
+                min +
+                "** – **" +
+                max +
+                "**\n" +
+                (reward ? "🎁 Winner gets a **1h key** (DM)\n" : "") +
+                "\nUse `/guess number:<your number>` to play!"
+            )
+            .setFooter({ text: "Started by " + interaction.user.tag })
+            .setTimestamp(),
+        ],
+      });
+      addLog("guess_start", interaction.user.tag, "", min + "-" + max + (reward ? " +reward" : ""));
+      try {
+        await interaction.followUp({
+          content: "✅ Game started. Secret number is **" + number + "** (only you know).",
+          ephemeral: true,
+        });
+      } catch (_) {}
+      return;
+    }
+
+    if (cmd === "guess") {
+      const guildId = interaction.guildId || "dm";
+      const game = guessGames.get(guildId);
+      if (!game || !game.active) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ No active game")
+              .setDescription("There is no Guess the Number game right now."),
+          ],
+        });
+      }
+      const n = interaction.options.getInteger("number");
+      if (n < game.min || n > game.max) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("⚠️ Out of range")
+              .setDescription(
+                "Guess between **" + game.min + "** and **" + game.max + "**."
+              ),
+          ],
+        });
+      }
+      game.guesses += 1;
+      game.tried.add(interaction.user.id);
+
+      if (n === game.number) {
+        game.active = false;
+        guessGames.delete(guildId);
+        addLog("guess_win", interaction.user.tag, "", "number " + n + " in " + game.guesses + " guesses");
+
+        let rewardMsg = "";
+        if (game.reward) {
+          const { key, data: kData } = makeKey1h("guess");
+          data.keys[key] = kData;
+          saveData(data);
+          const dmOk = await sendKeyDM(interaction.user, key, "1h");
+          rewardMsg = dmOk
+            ? "\n\n🎁 **1h key** sent to your **DMs**!"
+            : "\n\n⚠️ DMs closed — key: `" + key + "`";
+        }
+
+        try {
+          await interaction.channel.send({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(0x2ecc71)
+                .setTitle("🎉 CORRECT!")
+                .setDescription(
+                  "**" +
+                    interaction.user.tag +
+                    "** found the number **" +
+                    n +
+                    "**!\n" +
+                    "Total guesses: **" +
+                    game.guesses +
+                    "**" +
+                    rewardMsg
+                )
+                .setTimestamp(),
+            ],
+          });
+        } catch (_) {}
+
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x2ecc71)
+              .setTitle("🎉 You won!")
+              .setDescription(
+                "The number was **" + n + "**!" + rewardMsg
+              )
+              .setTimestamp(),
+          ],
+        });
+      }
+
+      // Hint: higher / lower
+      const hint = n < game.number ? "📈 **Higher!**" : "📉 **Lower!**";
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe67e22)
+            .setTitle("🎯 Wrong guess")
+            .setDescription(
+              "You guessed **" +
+                n +
+                "**\n" +
+                hint +
+                "\n\nRange: **" +
+                game.min +
+                "** – **" +
+                game.max +
+                "**\nGuesses so far: **" +
+                game.guesses +
+                "**"
+            )
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    if (cmd === "guessend") {
+      const guildId = interaction.guildId || "dm";
+      const game = guessGames.get(guildId);
+      if (!game || !game.active) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x95a5a6)
+              .setTitle("ℹ️ No active game")
+              .setDescription("Nothing to end."),
+          ],
+        });
+      }
+      const secret = game.number;
+      game.active = false;
+      guessGames.delete(guildId);
+      addLog("guess_end", interaction.user.tag, "", "was " + secret);
+      try {
+        await interaction.channel.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x95a5a6)
+              .setTitle("🛑 Game ended")
+              .setDescription(
+                "Guess the Number was stopped by **" +
+                  interaction.user.tag +
+                  "**.\nThe number was **" +
+                  secret +
+                  "**."
+              )
+              .setTimestamp(),
+          ],
+        });
+      } catch (_) {}
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x95a5a6)
+            .setTitle("🛑 Ended")
+            .setDescription("Game closed. Number was **" + secret + "**."),
+        ],
+      });
+    }
+
+    if (cmd === "guessinfo") {
+      const guildId = interaction.guildId || "dm";
+      const game = guessGames.get(guildId);
+      if (!game || !game.active) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x95a5a6)
+              .setTitle("ℹ️ No active game")
+              .setDescription("No Guess the Number game is running."),
+          ],
+        });
+      }
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe67e22)
+            .setTitle("ℹ️ Guess the Number")
+            .setDescription(
+              "🔢 Range: **" +
+                game.min +
+                "** – **" +
+                game.max +
+                "**\n" +
+                "🎯 Guesses: **" +
+                game.guesses +
+                "**\n" +
+                "🎁 Reward: **" +
+                (game.reward ? "1h key" : "none") +
+                "**\n" +
+                "👤 Started by: **" +
+                game.startedBy +
+                "**"
+            )
+            .setTimestamp(),
+        ],
+      });
+    }
+
     // KEYDROP
     if (cmd === "keydrop") {
       const durationStr = interaction.options.getString("duration");
@@ -1687,6 +2182,561 @@ client.on("interactionCreate", async (interaction) => {
             .setTitle("📍 Recent TP logs")
             .setDescription(lines.join("\n").slice(0, 4000))
             .setTimestamp(),
+        ],
+      });
+    }
+
+    // ─── LEADERBOARD ───────────────────────────────────────
+    if (cmd === "leaderboard") {
+      const type = interaction.options.getString("type");
+      data.stats = data.stats || {};
+      data.invites = data.invites || {};
+      let rows = [];
+      if (type === "invites") {
+        rows = Object.entries(data.invites)
+          .map(([id, pts]) => ({ id, score: (pts || 0) + (data.invitesUsed[id] || 0) }))
+          .filter((r) => r.score > 0)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 10);
+      } else {
+        const field =
+          type === "spins" ? "spinWins" : type === "dice" ? "diceWins" : "redeems";
+        rows = Object.entries(data.stats)
+          .map(([id, s]) => ({ id, score: s[field] || 0 }))
+          .filter((r) => r.score > 0)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 10);
+      }
+      if (!rows.length) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x95a5a6)
+              .setTitle("🏆 Leaderboard")
+              .setDescription("No data yet for **" + type + "**."),
+          ],
+        });
+      }
+      const medals = ["🥇", "🥈", "🥉"];
+      const lines = rows.map((r, i) => {
+        const m = medals[i] || "`" + (i + 1) + ".`";
+        return m + " <@" + r.id + "> — **" + r.score + "**";
+      });
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xf1c40f)
+            .setTitle("🏆 Leaderboard — " + type)
+            .setDescription(lines.join("\n"))
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    // ─── DAILY STREAK ──────────────────────────────────────
+    if (cmd === "daily") {
+      const uid = interaction.user.id;
+      data.streaks = data.streaks || {};
+      const today = dayKey();
+      const st = data.streaks[uid] || { count: 0, lastDay: "" };
+      if (st.lastDay === today) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("📅 Already claimed")
+              .setDescription(
+                "You already claimed today.\n🔥 Streak: **" + st.count + "** day(s)"
+              ),
+          ],
+        });
+      }
+      const yesterday = new Date(Date.now() - DAY_MS).toISOString().slice(0, 10);
+      if (st.lastDay === yesterday) st.count += 1;
+      else st.count = 1;
+      st.lastDay = today;
+      data.streaks[uid] = st;
+
+      // Reward: 1 bonus spin, every 7 days a 1h key
+      data.spinsBonus[uid] = (data.spinsBonus[uid] || 0) + 1;
+      delete data.spins[uid];
+      let extra = "";
+      if (st.count > 0 && st.count % 7 === 0) {
+        const { key, data: kData } = makeKey1h("streak");
+        data.keys[key] = kData;
+        const dmOk = await sendKeyDM(interaction.user, key, "1h");
+        extra = dmOk
+          ? "\n\n🎁 **7-day streak!** 1h key sent to your **DMs**!"
+          : "\n\n🎁 **7-day streak!** Key: `" + key + "`";
+      }
+      saveData(data);
+      addLog("daily", interaction.user.tag, "", "streak " + st.count);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe67e22)
+            .setTitle("🔥 Daily claimed!")
+            .setDescription(
+              "🔥 Streak: **" +
+                st.count +
+                "** day(s)\n🎰 **+1 bonus spin**" +
+                extra
+            )
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    if (cmd === "streak") {
+      const uid = interaction.user.id;
+      const st = (data.streaks || {})[uid] || { count: 0, lastDay: "" };
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe67e22)
+            .setTitle("🔥 Your streak")
+            .setDescription(
+              "Current streak: **" +
+                st.count +
+                "** day(s)\nLast claim: **" +
+                (st.lastDay || "never") +
+                "**\n\nUse `/daily` every day. Every **7** days → 1h key!"
+            )
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    // ─── PROMO CODES ───────────────────────────────────────
+    if (cmd === "createcode") {
+      const raw = interaction.options.getString("code").trim().toUpperCase();
+      const durationStr = interaction.options.getString("duration");
+      const maxUses = interaction.options.getInteger("maxuses") || 1;
+      const hours = interaction.options.getInteger("hours");
+      const parsed = parseDuration(durationStr);
+      if (!parsed) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Invalid duration")
+              .setDescription("Examples: `1h`, `1d`"),
+          ],
+        });
+      }
+      data.codes = data.codes || {};
+      data.codes[raw] = {
+        duration: durationStr,
+        lifetime: parsed.lifetime,
+        seconds: parsed.seconds,
+        maxUses,
+        uses: 0,
+        expiresAt: hours && hours > 0 ? Date.now() + hours * 3600000 : null,
+        createdBy: interaction.user.tag,
+        createdAt: new Date().toISOString(),
+      };
+      saveData(data);
+      addLog("createcode", interaction.user.tag, "", raw + " " + durationStr);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("🏷️ Code created")
+            .setDescription(
+              "Code: `" +
+                raw +
+                "`\nDuration: **" +
+                durationStr +
+                "**\nMax uses: **" +
+                maxUses +
+                "**" +
+                (hours ? "\nExpires in: **" + hours + "h**" : "\nExpires: **never**")
+            ),
+        ],
+      });
+    }
+
+    if (cmd === "code") {
+      const raw = interaction.options.getString("code").trim().toUpperCase();
+      data.codes = data.codes || {};
+      const c = data.codes[raw];
+      if (!c) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Invalid code")
+              .setDescription("This promo code does not exist."),
+          ],
+        });
+      }
+      if (c.expiresAt && Date.now() > c.expiresAt) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Code expired")
+              .setDescription("This code is no longer valid."),
+          ],
+        });
+      }
+      if (c.uses >= c.maxUses) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Code exhausted")
+              .setDescription("All uses of this code have been claimed."),
+          ],
+        });
+      }
+      c.usedBy = c.usedBy || [];
+      if (c.usedBy.includes(interaction.user.id)) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("⚠️ Already used")
+              .setDescription("You already redeemed this code."),
+          ],
+        });
+      }
+      c.uses += 1;
+      c.usedBy.push(interaction.user.id);
+      const { key, data: kData } = makeKey(
+        c.duration,
+        c.seconds || 3600,
+        "code:" + raw
+      );
+      data.keys[key] = kData;
+      bumpStat(data, interaction.user.id, "codes");
+      saveData(data);
+      addLog("code", interaction.user.tag, "", raw + " → " + key);
+      const dmOk = await sendKeyDM(interaction.user, key, c.duration);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("✅ Code redeemed!")
+            .setDescription(
+              dmOk
+                ? "📩 **" + c.duration + "** key sent to your **DMs**!"
+                : "⚠️ DMs closed — key: `" + key + "`"
+            )
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    if (cmd === "listcodes") {
+      data.codes = data.codes || {};
+      const entries = Object.entries(data.codes);
+      if (!entries.length) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x95a5a6)
+              .setTitle("🏷️ Codes")
+              .setDescription("No codes."),
+          ],
+        });
+      }
+      const lines = entries.map(([code, c]) => {
+        const left = c.maxUses - c.uses;
+        const exp =
+          c.expiresAt && Date.now() > c.expiresAt
+            ? "EXPIRED"
+            : c.expiresAt
+              ? "exp " + new Date(c.expiresAt).toISOString().slice(0, 16)
+              : "no exp";
+        return (
+          "`" +
+          code +
+          "` — **" +
+          c.duration +
+          "** · " +
+          left +
+          "/" +
+          c.maxUses +
+          " left · " +
+          exp
+        );
+      });
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x00e5ff)
+            .setTitle("🏷️ Promo codes")
+            .setDescription(lines.join("\n").slice(0, 4000)),
+        ],
+      });
+    }
+
+    if (cmd === "deletecode") {
+      const raw = interaction.options.getString("code").trim().toUpperCase();
+      data.codes = data.codes || {};
+      if (!data.codes[raw]) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Not found")
+              .setDescription("Code `" + raw + "` does not exist."),
+          ],
+        });
+      }
+      delete data.codes[raw];
+      saveData(data);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe74c3c)
+            .setTitle("🗑️ Code deleted")
+            .setDescription("`" + raw + "` removed."),
+        ],
+      });
+    }
+
+    // ─── BLACKLIST ─────────────────────────────────────────
+    if (cmd === "blacklist") {
+      const username = interaction.options.getString("username").toLowerCase();
+      const reason = interaction.options.getString("reason") || "No reason";
+      data.blacklist = data.blacklist || {};
+      data.blacklist[username] = {
+        reason,
+        by: interaction.user.tag,
+        at: new Date().toISOString(),
+      };
+      // also remove access
+      delete data.whitelist[username];
+      delete data.lifetimeWhitelist[username];
+      saveData(data);
+      addLog("blacklist", interaction.user.tag, username, reason);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe74c3c)
+            .setTitle("🚫 Blacklisted")
+            .setDescription("**" + username + "**\nReason: " + reason),
+        ],
+      });
+    }
+
+    if (cmd === "unblacklist") {
+      const username = interaction.options.getString("username").toLowerCase();
+      data.blacklist = data.blacklist || {};
+      if (!data.blacklist[username]) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x95a5a6)
+              .setTitle("ℹ️ Not blacklisted")
+              .setDescription("**" + username + "** is not on the list."),
+          ],
+        });
+      }
+      delete data.blacklist[username];
+      saveData(data);
+      addLog("unblacklist", interaction.user.tag, username, "");
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("✅ Unblacklisted")
+            .setDescription("**" + username + "** removed from blacklist."),
+        ],
+      });
+    }
+
+    if (cmd === "blacklistcheck") {
+      const username = interaction.options.getString("username").toLowerCase();
+      data.blacklist = data.blacklist || {};
+      const b = data.blacklist[username];
+      if (!b) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x2ecc71)
+              .setTitle("✅ Not blacklisted")
+              .setDescription("**" + username + "** is clean."),
+          ],
+        });
+      }
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe74c3c)
+            .setTitle("🚫 Blacklisted")
+            .setDescription(
+              "**" +
+                username +
+                "**\nReason: " +
+                (b.reason || "—") +
+                "\nBy: " +
+                (b.by || "?") +
+                "\nAt: " +
+                (b.at || "?")
+            ),
+        ],
+      });
+    }
+
+    // ─── CHECK EXPIRES ─────────────────────────────────────
+    if (cmd === "checkexpires") {
+      const hours = interaction.options.getInteger("hours") || 24;
+      const now = Math.floor(Date.now() / 1000);
+      const limit = now + hours * 3600;
+      const soon = [];
+      for (const [name, exp] of Object.entries(data.whitelist || {})) {
+        if (exp > now && exp <= limit) {
+          const leftMin = Math.floor((exp - now) / 60);
+          soon.push("• **" + name + "** — " + leftMin + " min left");
+        }
+      }
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xf39c12)
+            .setTitle("⏰ Expiring within " + hours + "h")
+            .setDescription(soon.length ? soon.join("\n") : "_Nobody expiring soon._")
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    // ─── RAFFLE ────────────────────────────────────────────
+    if (cmd === "raffle") {
+      const prize = interaction.options.getString("prize");
+      const guildId = interaction.guildId || "dm";
+      if (activeRaffles.has(guildId) && activeRaffles.get(guildId).active) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("⚠️ Raffle already running")
+              .setDescription("End it with `/raffleend` first."),
+          ],
+        });
+      }
+      try {
+        await interaction.deleteReply().catch(() => {});
+      } catch (_) {}
+      const msg = await interaction.channel.send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe91e63)
+            .setTitle("🎊 RAFFLE!")
+            .setDescription(
+              "Prize: **" +
+                prize +
+                "**\n\nClick **Join** to enter!\nAdmin ends with `/raffleend`."
+            )
+            .setFooter({ text: "LARP TP • Raffle" })
+            .setTimestamp(),
+        ],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId("raffle_join")
+              .setLabel("Join")
+              .setEmoji("🎟️")
+              .setStyle(ButtonStyle.Primary)
+          ),
+        ],
+      });
+      activeRaffles.set(guildId, {
+        active: true,
+        prize,
+        entrants: new Set(),
+        messageId: msg.id,
+        channelId: interaction.channelId,
+      });
+      addLog("raffle", interaction.user.tag, "", prize);
+      try {
+        await interaction.followUp({ content: "✅ Raffle started.", ephemeral: true });
+      } catch (_) {}
+      return;
+    }
+
+    if (cmd === "raffleend") {
+      const guildId = interaction.guildId || "dm";
+      const raffle = activeRaffles.get(guildId);
+      if (!raffle || !raffle.active) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x95a5a6)
+              .setTitle("ℹ️ No active raffle")
+              .setDescription("Nothing to draw."),
+          ],
+        });
+      }
+      raffle.active = false;
+      const list = [...raffle.entrants];
+      if (!list.length) {
+        activeRaffles.delete(guildId);
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ No entrants")
+              .setDescription("Nobody joined the raffle."),
+          ],
+        });
+      }
+      const winnerId = list[Math.floor(Math.random() * list.length)];
+      activeRaffles.delete(guildId);
+      addLog("raffle_win", "<@" + winnerId + ">", "", raffle.prize);
+
+      // If prize looks like a key duration, give a key
+      const parsed = parseDuration(raffle.prize.replace(/\s/g, ""));
+      let prizeExtra = "";
+      if (parsed && !parsed.lifetime) {
+        try {
+          const user = await client.users.fetch(winnerId);
+          const { key, data: kData } = makeKey(
+            raffle.prize.match(/\d+\s*[mhd]/i)
+              ? raffle.prize.match(/\d+\s*[a-z]+/i)[0].replace(/\s/g, "")
+              : "1h",
+            parsed.seconds || 3600,
+            "raffle"
+          );
+          data.keys[key] = kData;
+          saveData(data);
+          const dmOk = await sendKeyDM(user, key, kData.duration);
+          prizeExtra = dmOk
+            ? "\n📩 Key sent to winner's DMs."
+            : "\nKey: `" + key + "`";
+        } catch (_) {}
+      }
+
+      try {
+        await interaction.channel.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x2ecc71)
+              .setTitle("🎊 Raffle winner!")
+              .setDescription(
+                "Prize: **" +
+                  raffle.prize +
+                  "**\nWinner: <@" +
+                  winnerId +
+                  ">\nEntrants: **" +
+                  list.length +
+                  "**" +
+                  prizeExtra
+              )
+              .setTimestamp(),
+          ],
+        });
+      } catch (_) {}
+
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("🎊 Drawn")
+            .setDescription("Winner: <@" + winnerId + ">"),
         ],
       });
     }
