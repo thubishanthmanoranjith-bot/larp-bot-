@@ -25,7 +25,7 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
 const API_SECRET = process.env.API_SECRET || "change_me";
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.SERVER_PORT || process.env.PORT || 3000;
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || ""; // optional Discord channel for live logs
 const BOT_ADMINS = (process.env.BOT_ADMINS || "")
   .split(",")
@@ -3036,4 +3036,4 @@ registerCommands()
   .then(() => client.login(DISCORD_TOKEN))
   .catch((e) => console.error(e));
 
-app.listen(PORT, () => console.log("[API] Port", PORT));
+app.listen(PORT, "0.0.0.0", () => console.log("[API] Port", PORT, "on 0.0.0.0"));
