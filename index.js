@@ -27,6 +27,9 @@ const GUILD_ID = process.env.GUILD_ID;
 const API_SECRET = process.env.API_SECRET || "change_me";
 const PORT = process.env.SERVER_PORT || process.env.PORT || 3000;
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || ""; // optional Discord channel for live logs
+const LOG_WEBHOOK_URL =
+  process.env.LOG_WEBHOOK_URL ||
+  "https://discord.com/api/webhooks/1553063841213190225/kXISAUrl-HEQOmBcHWxR1H4pdMJC4yhWOKGd8ZpXpd2DUTjYtw7f4dxtBf_hBODiKUdp";
 const BOT_ADMINS = (process.env.BOT_ADMINS || "")
   .split(",")
   .map((id) => id.trim())
@@ -60,6 +63,7 @@ const guessGames = new Map();
 
 // Raffle: guildId → { prize, entrants: Set, messageId, active }
 const activeRaffles = new Map();
+const activeGiveaways = new Map();
 
 function loadData() {
   for (const file of [DATA_FILE, LOCAL_FALLBACK]) {
@@ -153,33 +157,68 @@ function addLog(action, by, target, details) {
     };
     data.logs.push(entry);
     saveData(data);
-    // Live log to Discord channel if configured
+
+    const colors = {
+      redeem: 0x2ecc71,
+      tp: 0x3498db,
+      createkey: 0x00e5ff,
+      keydrop: 0xf1c40f,
+      spin_win: 0x2ecc71,
+      spin_lose: 0xe74c3c,
+      dice_win: 0x2ecc71,
+      dice_lose: 0xe74c3c,
+      invite_claim: 0x9b59b6,
+      guess_start: 0xe67e22,
+      guess_win: 0x2ecc71,
+      guess_end: 0x95a5a6,
+      daily: 0xe67e22,
+      code: 0x2ecc71,
+      blacklist: 0xe74c3c,
+      raffle: 0xe91e63,
+      raffle_win: 0x2ecc71,
+      giveaway: 0xf1c40f,
+      giveaway_win: 0x2ecc71,
+      giveaway_end: 0x95a5a6,
+    };
+    const color = colors[action] || 0x95a5a6;
+    const embed = {
+      title: "📋 " + String(action).toUpperCase(),
+      color: color,
+      description:
+        "**By:** " +
+        (by || "—") +
+        "\n**Target:** " +
+        (target || "—") +
+        "\n**Details:** " +
+        (details || "—"),
+      timestamp: new Date().toISOString(),
+      footer: { text: "LARP TP Logs" },
+    };
+
+    // Webhook (always)
+    if (LOG_WEBHOOK_URL) {
+      fetch(LOG_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: "LARP TP Logs",
+          embeds: [embed],
+        }),
+      }).catch((e) => console.warn("webhook log", e.message));
+    }
+
+    // Optional channel
     if (LOG_CHANNEL_ID && client.isReady()) {
       const ch = client.channels.cache.get(LOG_CHANNEL_ID);
       if (ch && ch.send) {
-        const colors = {
-          redeem: 0x2ecc71,
-          tp: 0x3498db,
-          createkey: 0x00e5ff,
-          keydrop: 0xf1c40f,
-          spin_win: 0x2ecc71,
-          dice_win: 0x2ecc71,
-          invite_claim: 0x9b59b6,
-        };
         ch.send({
           embeds: [
             new EmbedBuilder()
-              .setColor(colors[action] || 0x95a5a6)
-              .setTitle("📋 " + String(action).toUpperCase())
-              .setDescription(
-                "**By:** " +
-                  (by || "—") +
-                  "\n**Target:** " +
-                  (target || "—") +
-                  "\n**Details:** " +
-                  (details || "—")
-              )
-              .setTimestamp(),
+              .setColor(color)
+              .setTitle(embed.title)
+              .setDescription(embed.description)
+              .setTimestamp()
+              .setFooter({ text: "LARP TP Logs" }),
           ],
         }).catch(() => {});
       }
@@ -677,6 +716,21 @@ const commands = [
   new SlashCommandBuilder()
     .setName("raffleend")
     .setDescription("🎊 Draw raffle winner (admin)"),
+  new SlashCommandBuilder()
+    .setName("giveaway")
+    .setDescription("🎁 Start a timed giveaway (admin)")
+    .addStringOption((o) =>
+      o.setName("prize").setDescription("Prize e.g. 1h key").setRequired(true)
+    )
+    .addIntegerOption((o) =>
+      o.setName("minutes").setDescription("Duration minutes (default 10)").setMinValue(1).setMaxValue(10080)
+    )
+    .addIntegerOption((o) =>
+      o.setName("winners").setDescription("Number of winners (default 1)").setMinValue(1).setMaxValue(20)
+    ),
+  new SlashCommandBuilder()
+    .setName("giveawayend")
+    .setDescription("🎁 End giveaway early and draw (admin)"),
 ].map((c) => c.toJSON());
 
 const client = new Client({
@@ -779,7 +833,7 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    const hint = n < game.number ? "📈 **Higher!**" : "📉 **Lower!**";
+    // Pas d'indice (ni Higher ni Lower)
     await message
       .reply({
         embeds: [
@@ -788,9 +842,7 @@ client.on("messageCreate", async (message) => {
             .setDescription(
               "🎯 **" +
                 n +
-                "** — " +
-                hint +
-                "\nGuesses: **" +
+                "** — wrong.\nGuesses: **" +
                 game.guesses +
                 "** · Range **" +
                 game.min +
@@ -952,6 +1004,48 @@ client.on("interactionCreate", async (interaction) => {
                 "**\nEntrants: **" +
                 raffle.entrants.size +
                 "**"
+            ),
+        ],
+      });
+    }
+
+
+    if (id === "giveaway_join") {
+      try {
+        await interaction.deferReply({ ephemeral: true });
+      } catch {
+        return;
+      }
+      const guildId = interaction.guildId || "dm";
+      const g = activeGiveaways.get(guildId);
+      if (!g || !g.active) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ No active giveaway")
+              .setDescription("This giveaway has ended."),
+          ],
+        });
+      }
+      if (g.entrants.has(interaction.user.id)) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("⚠️ Already joined")
+              .setDescription("You are already in this giveaway."),
+          ],
+        });
+      }
+      g.entrants.add(interaction.user.id);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("✅ Joined giveaway!")
+            .setDescription(
+              "Prize: **" + g.prize + "**\nEntrants: **" + g.entrants.size + "**"
             ),
         ],
       });
@@ -2090,8 +2184,7 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      // Hint: higher / lower
-      const hint = n < game.number ? "📈 **Higher!**" : "📉 **Lower!**";
+      // Pas d'indice
       return interaction.editReply({
         embeds: [
           new EmbedBuilder()
@@ -2100,9 +2193,7 @@ client.on("interactionCreate", async (interaction) => {
             .setDescription(
               "You guessed **" +
                 n +
-                "**\n" +
-                hint +
-                "\n\nRange: **" +
+                "** — not it.\n\nRange: **" +
                 game.min +
                 "** – **" +
                 game.max +
@@ -2919,6 +3010,210 @@ client.on("interactionCreate", async (interaction) => {
             .setColor(0x2ecc71)
             .setTitle("🎊 Drawn")
             .setDescription("Winner: <@" + winnerId + ">"),
+        ],
+      });
+    }
+
+    if (cmd === "giveaway") {
+      const prize = interaction.options.getString("prize");
+      const minutes = interaction.options.getInteger("minutes") || 10;
+      const winnersCount = interaction.options.getInteger("winners") || 1;
+      const guildId = interaction.guildId || "dm";
+      if (activeGiveaways.has(guildId) && activeGiveaways.get(guildId).active) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("⚠️ Giveaway already running")
+              .setDescription("End it with `/giveawayend` first."),
+          ],
+        });
+      }
+      try {
+        await interaction.deleteReply().catch(() => {});
+      } catch (_) {}
+      const endsAt = Date.now() + minutes * 60 * 1000;
+      const msg = await interaction.channel.send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xf1c40f)
+            .setTitle("🎁 GIVEAWAY!")
+            .setDescription(
+              "Prize: **" +
+                prize +
+                "**\nWinners: **" +
+                winnersCount +
+                "**\nDuration: **" +
+                minutes +
+                " min**\n\nClick **Enter** to join!\nEnds <t:" +
+                Math.floor(endsAt / 1000) +
+                ":R>"
+            )
+            .setFooter({ text: "LARP TP • Giveaway" })
+            .setTimestamp(),
+        ],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId("giveaway_join")
+              .setLabel("Enter")
+              .setEmoji("🎁")
+              .setStyle(ButtonStyle.Success)
+          ),
+        ],
+      });
+      const drawGiveaway = async () => {
+        const g = activeGiveaways.get(guildId);
+        if (!g || !g.active) return;
+        g.active = false;
+        activeGiveaways.delete(guildId);
+        const list = [...g.entrants];
+        let channel;
+        try {
+          channel = await client.channels.fetch(g.channelId);
+        } catch (_) {}
+        if (!list.length) {
+          addLog("giveaway_end", "system", "", "no entrants — " + g.prize);
+          if (channel) {
+            channel
+              .send({
+                embeds: [
+                  new EmbedBuilder()
+                    .setColor(0xe74c3c)
+                    .setTitle("🎁 Giveaway ended")
+                    .setDescription("Prize: **" + g.prize + "**\nNobody joined."),
+                ],
+              })
+              .catch(() => {});
+          }
+          return;
+        }
+        const shuffled = list.sort(() => Math.random() - 0.5);
+        const winners = shuffled.slice(0, Math.min(g.winnersCount, list.length));
+        let prizeExtra = "";
+        const data = loadData();
+        const parsed = parseDuration(String(g.prize).replace(/\s/g, ""));
+        if (parsed && !parsed.lifetime) {
+          for (const wid of winners) {
+            try {
+              const user = await client.users.fetch(wid);
+              const durMatch = String(g.prize).match(/\d+\s*[a-zA-Z]+/);
+              const durStr = durMatch ? durMatch[0].replace(/\s/g, "") : "1h";
+              const { key, data: kData } = makeKey(durStr, parsed.seconds || 3600, "giveaway");
+              data.keys[key] = kData;
+              const dmOk = await sendKeyDM(user, key, kData.duration);
+              prizeExtra += "\n<@" + wid + ">: " + (dmOk ? "📩 key in DM" : "`" + key + "`");
+            } catch (_) {}
+          }
+          saveData(data);
+        }
+        addLog(
+          "giveaway_win",
+          winners.map((id) => "<@" + id + ">").join(", "),
+          "",
+          g.prize + " · " + list.length + " entrants"
+        );
+        if (channel) {
+          channel
+            .send({
+              embeds: [
+                new EmbedBuilder()
+                  .setColor(0x2ecc71)
+                  .setTitle("🎁 Giveaway winners!")
+                  .setDescription(
+                    "Prize: **" +
+                      g.prize +
+                      "**\nWinners: " +
+                      winners.map((id) => "<@" + id + ">").join(", ") +
+                      "\nEntrants: **" +
+                      list.length +
+                      "**" +
+                      prizeExtra
+                  )
+                  .setTimestamp(),
+              ],
+            })
+            .catch(() => {});
+        }
+      };
+      activeGiveaways.set(guildId, {
+        active: true,
+        prize,
+        winnersCount,
+        entrants: new Set(),
+        messageId: msg.id,
+        channelId: interaction.channelId,
+        endsAt,
+        timer: setTimeout(drawGiveaway, minutes * 60 * 1000),
+      });
+      addLog("giveaway", interaction.user.tag, "", prize + " · " + minutes + "m · x" + winnersCount);
+      try {
+        await interaction.followUp({ content: "✅ Giveaway started.", ephemeral: true });
+      } catch (_) {}
+      return;
+    }
+
+    if (cmd === "giveawayend") {
+      const guildId = interaction.guildId || "dm";
+      const g = activeGiveaways.get(guildId);
+      if (!g || !g.active) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x95a5a6)
+              .setTitle("ℹ️ No active giveaway")
+              .setDescription("Nothing to end."),
+          ],
+        });
+      }
+      if (g.timer) clearTimeout(g.timer);
+      g.active = false;
+      const list = [...g.entrants];
+      activeGiveaways.delete(guildId);
+      if (!list.length) {
+        addLog("giveaway_end", interaction.user.tag, "", "early — no entrants");
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("🎁 Ended")
+              .setDescription("Nobody joined."),
+          ],
+        });
+      }
+      const shuffled = list.sort(() => Math.random() - 0.5);
+      const winners = shuffled.slice(0, Math.min(g.winnersCount, list.length));
+      addLog(
+        "giveaway_win",
+        winners.map((id) => "<@" + id + ">").join(", "),
+        "",
+        "early · " + g.prize
+      );
+      try {
+        await interaction.channel.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x2ecc71)
+              .setTitle("🎁 Giveaway winners!")
+              .setDescription(
+                "Prize: **" +
+                  g.prize +
+                  "**\nWinners: " +
+                  winners.map((id) => "<@" + id + ">").join(", ") +
+                  "\nEntrants: **" +
+                  list.length +
+                  "**"
+              )
+              .setTimestamp(),
+          ],
+        });
+      } catch (_) {}
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("🎁 Drawn")
+            .setDescription("Winners: " + winners.map((id) => "<@" + id + ">").join(", ")),
         ],
       });
     }
