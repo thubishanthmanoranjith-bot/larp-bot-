@@ -65,6 +65,29 @@ const guessGames = new Map();
 const activeRaffles = new Map();
 const activeGiveaways = new Map();
 
+async function lockGuessChannel(channel, reason) {
+  if (!channel || !channel.permissionOverwrites) return;
+  try {
+    const everyone = channel.guild.roles.everyone;
+    await channel.permissionOverwrites.edit(everyone, {
+      SendMessages: false,
+      AddReactions: false,
+    });
+    await channel
+      .send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x95a5a6)
+            .setTitle("🔒 Channel locked")
+            .setDescription(reason || "Guess the Number is over. Chat is locked."),
+        ],
+      })
+      .catch(() => {});
+  } catch (e) {
+    console.warn("lockGuessChannel", e.message);
+  }
+}
+
 function loadData() {
   for (const file of [DATA_FILE, LOCAL_FALLBACK]) {
     try {
@@ -830,29 +853,14 @@ client.on("messageCreate", async (message) => {
           ],
         })
         .catch(() => {});
+      await lockGuessChannel(
+        message.channel,
+        "🎯 **" + message.author.tag + "** found the number. Channel locked."
+      );
       return;
     }
 
-    // Pas d'indice (ni Higher ni Lower)
-    await message
-      .reply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xe67e22)
-            .setDescription(
-              "🎯 **" +
-                n +
-                "** — wrong.\nGuesses: **" +
-                game.guesses +
-                "** · Range **" +
-                game.min +
-                "–" +
-                game.max +
-                "**"
-            ),
-        ],
-      })
-      .catch(() => {});
+    // Mauvais essai: aucun message (silencieux)
   } catch (err) {
     console.error("[guess chat]", err);
   }
@@ -2171,6 +2179,11 @@ client.on("interactionCreate", async (interaction) => {
           });
         } catch (_) {}
 
+        await lockGuessChannel(
+          interaction.channel,
+          "🎯 **" + interaction.user.tag + "** found the number. Channel locked."
+        );
+
         return interaction.editReply({
           embeds: [
             new EmbedBuilder()
@@ -2184,26 +2197,13 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      // Pas d'indice
-      return interaction.editReply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xe67e22)
-            .setTitle("🎯 Wrong guess")
-            .setDescription(
-              "You guessed **" +
-                n +
-                "** — not it.\n\nRange: **" +
-                game.min +
-                "** – **" +
-                game.max +
-                "**\nGuesses so far: **" +
-                game.guesses +
-                "**"
-            )
-            .setTimestamp(),
-        ],
-      });
+      // Mauvais essai: silencieux
+      try {
+        await interaction.deleteReply();
+      } catch (_) {
+        await interaction.editReply({ content: "\u200b" }).catch(() => {});
+      }
+      return;
     }
 
     if (cmd === "guessend") {
