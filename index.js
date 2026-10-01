@@ -56,6 +56,7 @@ const DICE_COLORS = [
 ];
 
 // Active keydrops: messageId → { keysLeft, duration, claimed: Set }
+const claimingUsers = new Set(); // anti double-click race
 const activeDrops = new Map();
 
 // Guess the number: guildId → game state
@@ -113,6 +114,7 @@ function loadData() {
         d.streaks = d.streaks || {}; // userId -> { count, lastDay }
         d.codes = d.codes || {}; // CODE -> { duration, maxUses, uses, reward, expiresAt }
         d.blacklist = d.blacklist || {}; // robloxUsername -> { reason, by, at }
+        d.keydropDaily = d.keydropDaily || {};
         return d;
       }
     } catch (e) {
@@ -621,6 +623,18 @@ const commands = [
     .setDescription("ℹ️ Info about the current Guess the Number game"),
   // KEYDROP
   new SlashCommandBuilder()
+    .setName("purgekeys")
+    .setDescription("🗑️ Delete ALL keys (unused + used) — admin")
+    .addBooleanOption((o) =>
+      o.setName("confirm").setDescription("Must be true to confirm").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("deletekey")
+    .setDescription("🗑️ Delete one key — admin")
+    .addStringOption((o) =>
+      o.setName("key").setDescription("LARP-XXXX key to delete").setRequired(true)
+    ),
+  new SlashCommandBuilder()
     .setName("keydrop")
     .setDescription("🎁 Drop claimable keys in this channel")
     .addStringOption((o) =>
@@ -878,97 +892,133 @@ client.on("interactionCreate", async (interaction) => {
       } catch {
         return;
       }
-      const msgId = id.replace("keydrop_claim_", "");
-      const drop = activeDrops.get(msgId);
-      if (!drop) {
-        return interaction.editReply({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0xe74c3c)
-              .setTitle("❌ Drop expired")
-              .setDescription("This keydrop is no longer active."),
-          ],
-        });
-      }
-      if (drop.claimed.has(interaction.user.id)) {
+      const uid = interaction.user.id;
+      // Anti double-clic / spam
+      if (claimingUsers.has(uid)) {
         return interaction.editReply({
           embeds: [
             new EmbedBuilder()
               .setColor(0xf39c12)
-              .setTitle("⚠️ Already claimed")
-              .setDescription("You already claimed a key from this drop."),
+              .setTitle("⏳ Wait")
+              .setDescription("Claim already in progress…"),
           ],
         });
       }
-      if (drop.keysLeft <= 0) {
+      claimingUsers.add(uid);
+      try {
+        const msgId = id.replace("keydrop_claim_", "");
+        const drop = activeDrops.get(msgId);
+        if (!drop) {
+          return interaction.editReply({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(0xe74c3c)
+                .setTitle("❌ Expired")
+                .setDescription("This keydrop is no longer active."),
+            ],
+          });
+        }
+        // 1 seule claim par user PAR drop (memoire)
+        if (drop.claimed.has(uid)) {
+          return interaction.editReply({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(0xf39c12)
+                .setTitle("⚠️ Already claimed")
+                .setDescription("You already claimed a key from this drop."),
+            ],
+          });
+        }
+        // 1 claim keydrop max par jour (persistant)
+        const data = loadData();
+        data.keydropDaily = data.keydropDaily || {};
+        const day = dayKey();
+        if (data.keydropDaily[uid] === day) {
+          return interaction.editReply({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(0xe74c3c)
+                .setTitle("🔒 Limit: 1 keydrop / day")
+                .setDescription(
+                  "You already claimed a keydrop today.\nCome back tomorrow."
+                ),
+            ],
+          });
+        }
+        if (drop.keysLeft <= 0) {
+          return interaction.editReply({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(0xe74c3c)
+                .setTitle("❌ Sold out")
+                .setDescription("All keys from this drop have been claimed."),
+            ],
+          });
+        }
+
+        // Reserve IMMEDIATELY (avant DM) pour bloquer les doubles
+        drop.keysLeft -= 1;
+        drop.claimed.add(uid);
+        data.keydropDaily[uid] = day;
+
+        const parsed = parseDuration(drop.duration);
+        const { key, data: kData } = makeKey(
+          drop.duration,
+          parsed ? parsed.seconds : 3600,
+          "keydrop"
+        );
+        kData.ownerDiscordId = uid;
+        data.keys[key] = kData;
+        saveData(data);
+        addLog("keydrop", interaction.user.tag, "", key + " (" + drop.duration + ")");
+
+        const dmOk = await sendKeyDM(interaction.user, key, drop.duration);
+
+        try {
+          const embed = EmbedBuilder.from(drop.embedData);
+          embed.setDescription(
+            drop.baseDesc +
+              "\n\n**Remaining:** `" +
+              drop.keysLeft +
+              "` / `" +
+              drop.total +
+              "`"
+          );
+          if (drop.keysLeft <= 0) {
+            embed.setColor(0x95a5a6);
+            embed.setTitle("🎁 Keydrop — SOLD OUT");
+          }
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId("keydrop_claim_" + msgId)
+              .setLabel(drop.keysLeft > 0 ? "Claim key" : "Sold out")
+              .setEmoji("🔑")
+              .setStyle(ButtonStyle.Success)
+              .setDisabled(drop.keysLeft <= 0)
+          );
+          await interaction.message.edit({ embeds: [embed], components: [row] });
+        } catch (_) {}
+
+        if (drop.keysLeft <= 0) activeDrops.delete(msgId);
+
         return interaction.editReply({
           embeds: [
             new EmbedBuilder()
-              .setColor(0xe74c3c)
-              .setTitle("❌ Sold out")
-              .setDescription("All keys from this drop have been claimed."),
+              .setColor(0x2ecc71)
+              .setTitle("✅ Key claimed!")
+              .setDescription(
+                dmOk
+                  ? "📩 **" + drop.duration + "** key sent to your **DMs**!\n*(1 keydrop max / day)*"
+                  : "⚠️ DMs closed — key: `" + key + "`\n*(1 keydrop max / day)*"
+              )
+              .setTimestamp(),
           ],
         });
+      } finally {
+        claimingUsers.delete(uid);
       }
-
-      drop.keysLeft -= 1;
-      drop.claimed.add(interaction.user.id);
-
-      const data = loadData();
-      const parsed = parseDuration(drop.duration);
-      const { key, data: kData } = makeKey(
-        drop.duration,
-        parsed ? parsed.seconds : 3600,
-        "keydrop"
-      );
-      data.keys[key] = kData;
-      saveData(data);
-      addLog("keydrop", interaction.user.tag, "", key + " (" + drop.duration + ")");
-
-      const dmOk = await sendKeyDM(interaction.user, key, drop.duration);
-
-      // Update drop message
-      try {
-        const embed = EmbedBuilder.from(drop.embedData);
-        embed.setDescription(
-          drop.baseDesc +
-            "\n\n**Remaining:** `" +
-            drop.keysLeft +
-            "` / `" +
-            drop.total +
-            "`"
-        );
-        if (drop.keysLeft <= 0) {
-          embed.setColor(0x95a5a6);
-          embed.setTitle("🎁 Keydrop — SOLD OUT");
-        }
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId("keydrop_claim_" + msgId)
-            .setLabel(drop.keysLeft > 0 ? "Claim key" : "Sold out")
-            .setEmoji("🔑")
-            .setStyle(ButtonStyle.Success)
-            .setDisabled(drop.keysLeft <= 0)
-        );
-        await interaction.message.edit({ embeds: [embed], components: [row] });
-      } catch (_) {}
-
-      if (drop.keysLeft <= 0) activeDrops.delete(msgId);
-
-      return interaction.editReply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0x2ecc71)
-            .setTitle("✅ Key claimed!")
-            .setDescription(
-              dmOk
-                ? "📩 **" + drop.duration + "** key sent to your **DMs**!"
-                : "⚠️ DMs closed — key: `" + key + "`"
-            )
-            .setTimestamp(),
-        ],
-      });
     }
+
 
     // Invite buttons
     // Raffle join
@@ -3214,6 +3264,70 @@ client.on("interactionCreate", async (interaction) => {
             .setColor(0x2ecc71)
             .setTitle("🎁 Drawn")
             .setDescription("Winners: " + winners.map((id) => "<@" + id + ">").join(", ")),
+        ],
+      });
+    }
+
+    if (cmd === "deletekey") {
+      const raw = String(interaction.options.getString("key") || "")
+        .trim()
+        .toUpperCase()
+        .replace(/\s+/g, "");
+      const data = loadData();
+      data.keys = data.keys || {};
+      let found = null;
+      for (const k of Object.keys(data.keys)) {
+        if (String(k).toUpperCase() === raw) {
+          found = k;
+          break;
+        }
+      }
+      if (!found) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Key not found")
+              .setDescription("`" + raw + "` does not exist."),
+          ],
+        });
+      }
+      delete data.keys[found];
+      saveData(data);
+      addLog("deletekey", interaction.user.tag, "", found);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("🗑️ Key deleted")
+            .setDescription("Removed `" + found + "`"),
+        ],
+      });
+    }
+
+    if (cmd === "purgekeys") {
+      const confirm = interaction.options.getBoolean("confirm");
+      if (!confirm) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("⚠️ Confirmation required")
+              .setDescription("Use `/purgekeys confirm:True` to delete **all** keys."),
+          ],
+        });
+      }
+      const data = loadData();
+      const count = Object.keys(data.keys || {}).length;
+      data.keys = {};
+      saveData(data);
+      addLog("purgekeys", interaction.user.tag, "", count + " keys deleted");
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe74c3c)
+            .setTitle("🗑️ All keys deleted")
+            .setDescription("Removed **" + count + "** key(s) from the database."),
         ],
       });
     }
