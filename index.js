@@ -885,7 +885,9 @@ const commands = [
     .addStringOption((o) => o.setName("username").setDescription("Roblox username")),
   new SlashCommandBuilder().setName("statuspanel").setDescription("📌 Post My Status panel (admin)"),
   new SlashCommandBuilder().setName("backup").setDescription("💾 Backup data to DMs (admin)"),
-  new SlashCommandBuilder().setName("coinflip").setDescription("🪙 Coin flip — win = 1 bonus spin"),
+  new SlashCommandBuilder()
+    .setName("coinflip")
+    .setDescription("🪙 Coin flip (1×/day) — win = 1 bonus spin"),
   new SlashCommandBuilder().setName("quest").setDescription("📜 Daily quest progress / claim"),
   new SlashCommandBuilder()
     .setName("warn")
@@ -4022,23 +4024,51 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (cmd === "coinflip") {
+      const uid = interaction.user.id;
+      const today = dayKey();
+      data.coinflip = data.coinflip || {};
+      if (data.coinflip[uid] === today) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("🪙 Coinflip — Already used")
+              .setDescription(
+                "<@" + uid + "> already flipped today!\nCome back **tomorrow**."
+              )
+              .setFooter({ text: "1 coinflip / day • LARP TP" })
+              .setTimestamp(),
+          ],
+        });
+      }
+      data.coinflip[uid] = today;
       const win = Math.random() < 0.5;
       if (win) {
-        data.spinsBonus[interaction.user.id] = (data.spinsBonus[interaction.user.id] || 0) + 1;
-        delete data.spins[interaction.user.id];
+        data.spinsBonus[uid] = (data.spinsBonus[uid] || 0) + 1;
+        delete data.spins[uid];
         saveData(data);
+        addLog("coinflip", interaction.user.tag, "", "win +1 spin");
         return interaction.editReply({
           embeds: [
             new EmbedBuilder()
               .setColor(0x2ecc71)
               .setTitle("🪙 Heads — You win!")
-              .setDescription("🎁 **+1 bonus spin**"),
+              .setDescription("🎁 **+1 bonus spin** — use `/spin`!\n\n_1 flip per day._")
+              .setFooter({ text: "1 coinflip / day" })
+              .setTimestamp(),
           ],
         });
       }
+      saveData(data);
+      addLog("coinflip", interaction.user.tag, "", "lose");
       return interaction.editReply({
         embeds: [
-          new EmbedBuilder().setColor(0x95a5a6).setTitle("🪙 Tails — No luck").setDescription("Try later."),
+          new EmbedBuilder()
+            .setColor(0x95a5a6)
+            .setTitle("🪙 Tails — No luck")
+            .setDescription("No bonus this time.\nTry again **tomorrow**.")
+            .setFooter({ text: "1 coinflip / day" })
+            .setTimestamp(),
         ],
       });
     }
