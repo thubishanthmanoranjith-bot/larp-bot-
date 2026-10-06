@@ -34,6 +34,9 @@ const BOT_ADMINS = (process.env.BOT_ADMINS || "")
   .split(",")
   .map((id) => id.trim())
   .filter(Boolean);
+const WHITELIST_ROLE_ID = process.env.WHITELIST_ROLE_ID || "";
+const TICKET_CATEGORY_ID = process.env.TICKET_CATEGORY_ID || "";
+const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID || "";
 
 // Do NOT use /tmp by default — wiped on redeploy
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
@@ -437,11 +440,14 @@ function diceVisual(pickEmoji, pick, rolledEmojis, match, extra) {
   );
 }
 
-function diceHasDuplicate(rolled) {
-  const counts = {};
+/** True if the player's chosen color appears 2+ times in the 4 rolls */
+function diceHasDuplicate(rolled, pick) {
+  let n = 0;
   for (const c of rolled) {
-    counts[c.value] = (counts[c.value] || 0) + 1;
-    if (counts[c.value] >= 2) return true;
+    if (c.value === pick) {
+      n++;
+      if (n >= 2) return true;
+    }
   }
   return false;
 }
@@ -793,13 +799,56 @@ const commands = [
     .addIntegerOption((o) =>
       o.setName("winners").setDescription("Number of winners (default: same as last)").setMinValue(1).setMaxValue(20)
     ),
+  new SlashCommandBuilder().setName("stats").setDescription("📊 Bot statistics (admin)"),
+  new SlashCommandBuilder()
+    .setName("status")
+    .setDescription("👤 Your access status")
+    .addStringOption((o) => o.setName("username").setDescription("Roblox username")),
+  new SlashCommandBuilder().setName("statuspanel").setDescription("📌 Post My Status panel (admin)"),
+  new SlashCommandBuilder().setName("backup").setDescription("💾 Backup data to DMs (admin)"),
+  new SlashCommandBuilder().setName("coinflip").setDescription("🪙 Coin flip — win = 1 bonus spin"),
+  new SlashCommandBuilder().setName("quest").setDescription("📜 Daily quest progress / claim"),
+  new SlashCommandBuilder()
+    .setName("warn")
+    .setDescription("⚠️ Warn a member (admin)")
+    .addUserOption((o) => o.setName("user").setDescription("Member").setRequired(true))
+    .addStringOption((o) => o.setName("reason").setDescription("Reason").setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("warns")
+    .setDescription("📋 View warns")
+    .addUserOption((o) => o.setName("user").setDescription("Member").setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("clearwarns")
+    .setDescription("🧹 Clear warns (admin)")
+    .addUserOption((o) => o.setName("user").setDescription("Member").setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("poll")
+    .setDescription("📊 Create a poll (admin)")
+    .addStringOption((o) => o.setName("question").setDescription("Question").setRequired(true))
+    .addStringOption((o) => o.setName("option1").setDescription("Option 1").setRequired(true))
+    .addStringOption((o) => o.setName("option2").setDescription("Option 2").setRequired(true))
+    .addStringOption((o) => o.setName("option3").setDescription("Option 3"))
+    .addStringOption((o) => o.setName("option4").setDescription("Option 4")),
+  new SlashCommandBuilder().setName("ticket").setDescription("🎫 Open a support ticket"),
+  new SlashCommandBuilder().setName("ticketpanel").setDescription("📌 Post ticket panel (admin)"),
+  new SlashCommandBuilder().setName("closeticket").setDescription("🔒 Close this ticket"),
+  new SlashCommandBuilder()
+    .setName("welcome")
+    .setDescription("👋 Post welcome message (admin)")
+    .addStringOption((o) => o.setName("text").setDescription("Custom text")),
+  new SlashCommandBuilder()
+    .setName("duel")
+    .setDescription("⚔️ Challenge to a spin duel")
+    .addUserOption((o) => o.setName("opponent").setDescription("Opponent").setRequired(true)),
 ].map((c) => c.toJSON());
+
+const activePolls = new Map();
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // needed to read number guesses in chat
+    GatewayIntentBits.MessageContent,
   ],
 });
 
@@ -1266,6 +1315,146 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
+    if (id === "status_check") {
+      data.discordToRoblox = data.discordToRoblox || {};
+      const uname = data.discordToRoblox[interaction.user.id];
+      if (!uname) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("👤 No linked account")
+              .setDescription("Redeem a key with `/redeem` first."),
+          ],
+        });
+      }
+      const now = Math.floor(Date.now() / 1000);
+      let status = "❌ No active access";
+      let color = 0x95a5a6;
+      if (data.lifetimeWhitelist && data.lifetimeWhitelist[uname]) {
+        status = "♾️ **LIFETIME**";
+        color = 0x9b59b6;
+      } else if (data.whitelist[uname] && data.whitelist[uname] > now) {
+        status =
+          "🟢 **WHITELIST** — " +
+          Math.floor((data.whitelist[uname] - now) / 60) +
+          " min left";
+        color = 0x2ecc71;
+      }
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(color)
+            .setTitle("👤 Your status")
+            .setDescription("Roblox: **" + uname + "**\n" + status)
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    if (id === "ticket_open") {
+      const guild = interaction.guild;
+      if (!guild) return interaction.editReply({ content: "Guild only." });
+      try {
+        const overwrites = [
+          { id: guild.id, deny: ["ViewChannel"] },
+          {
+            id: interaction.user.id,
+            allow: ["ViewChannel", "SendMessages", "ReadMessageHistory", "AttachFiles"],
+          },
+          { id: client.user.id, allow: ["ViewChannel", "SendMessages", "ManageChannels"] },
+        ];
+        for (const adminId of BOT_ADMINS) {
+          overwrites.push({
+            id: adminId,
+            allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"],
+          });
+        }
+        const ch = await guild.channels.create({
+          name: "ticket-" + interaction.user.username.toLowerCase().slice(0, 20),
+          type: 0,
+          parent: TICKET_CATEGORY_ID || undefined,
+          permissionOverwrites: overwrites,
+        });
+        await ch.send({
+          content: "<@" + interaction.user.id + ">",
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x3498db)
+              .setTitle("🎫 Support ticket")
+              .setDescription("Describe your issue. Close with `/closeticket`.")
+              .setTimestamp(),
+          ],
+        });
+        return interaction.editReply({ content: "✅ Ticket: <#" + ch.id + ">" });
+      } catch (e) {
+        return interaction.editReply({ content: "❌ `" + e.message + "`" });
+      }
+    }
+
+    if (id.startsWith("poll_")) {
+      const opt = parseInt(id.split("_")[1], 10);
+      const poll = activePolls.get(interaction.message.id);
+      if (!poll) return interaction.editReply({ content: "Poll closed." });
+      for (const set of Object.values(poll.votes)) set.delete(interaction.user.id);
+      if (!poll.votes[opt]) poll.votes[opt] = new Set();
+      poll.votes[opt].add(interaction.user.id);
+      const lines = poll.options.map(
+        (o, i) =>
+          i + 1 + ". **" + o + "** — " + ((poll.votes[i] && poll.votes[i].size) || 0) + " vote(s)"
+      );
+      try {
+        await interaction.message.edit({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x3498db)
+              .setTitle("📊 " + poll.question)
+              .setDescription(lines.join("\n"))
+              .setFooter({ text: "Click to vote" })
+              .setTimestamp(),
+          ],
+        });
+      } catch (_) {}
+      return interaction.editReply({ content: "✅ Vote recorded." });
+    }
+
+    if (id.startsWith("duel_accept_")) {
+      const challengerId = id.replace("duel_accept_", "");
+      if (interaction.user.id === challengerId)
+        return interaction.editReply({ content: "Can't accept your own duel." });
+      const a = Math.floor(Math.random() * 100) + 1;
+      const b = Math.floor(Math.random() * 100) + 1;
+      let result;
+      if (a > b) result = "<@" + challengerId + "> wins (**" + a + "** vs **" + b + "**)!";
+      else if (b > a)
+        result = "<@" + interaction.user.id + "> wins (**" + b + "** vs **" + a + "**)!";
+      else result = "Tie! (**" + a + "** vs **" + b + "**)";
+      try {
+        await interaction.message.edit({
+          components: [],
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe67e22)
+              .setTitle("⚔️ Duel result")
+              .setDescription(result)
+              .setTimestamp(),
+          ],
+        });
+      } catch (_) {}
+      return interaction.editReply({ content: "⚔️ " + result });
+    }
+
+    if (id === "rules_ack") {
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("✅ Thanks!")
+            .setDescription("You're all set. Have fun!"),
+        ],
+      });
+    }
+
     return interaction.editReply({ content: "❓ Unknown button." });
   }
 
@@ -1298,6 +1487,12 @@ client.on("interactionCreate", async (interaction) => {
     "streak",
     "code",
     "blacklistcheck",
+    "status",
+    "coinflip",
+    "quest",
+    "warns",
+    "ticket",
+    "duel",
   ];
   const needsAdmin = !publicCmds.includes(cmd);
 
@@ -1848,7 +2043,8 @@ client.on("interactionCreate", async (interaction) => {
         rolled.push(DICE_COLORS[Math.floor(Math.random() * DICE_COLORS.length)]);
       }
       const rolledEmojis = rolled.map((c) => c.emoji);
-      const hasDup = diceHasDuplicate(rolled);
+      // Reroll only if YOUR chosen color appears 2+ times
+      const hasDup = diceHasDuplicate(rolled, pick);
       const remaining = getBonus(data, "dice", uid);
 
       if (hasDup) {
@@ -1860,7 +2056,7 @@ client.on("interactionCreate", async (interaction) => {
             embeds: [
               new EmbedBuilder()
                 .setColor(0xe74c3c)
-                .setTitle("🎲 DICE — Loss (double duplicate)")
+                .setTitle("🎲 DICE — Loss (double your color)")
                 .setDescription(
                   mention +
                     " lost...\n\n" +
@@ -1869,7 +2065,7 @@ client.on("interactionCreate", async (interaction) => {
                       pick,
                       rolledEmojis,
                       false,
-                      "💥 **Same color 2× again** on the reroll — you lose!"
+                      "💥 **Your color appeared 2× again** on the reroll — you lose!"
                     )
                 )
                 .setFooter({ text: "Bonus left: " + remaining + " • 1 dice / day" })
@@ -1879,12 +2075,12 @@ client.on("interactionCreate", async (interaction) => {
         }
         data.diceReroll[uid] = { previousPick: pick, at: now };
         saveData(data);
-        addLog("dice_reroll", interaction.user.tag, "", pick + " (duplicate)");
+        addLog("dice_reroll", interaction.user.tag, "", pick + " (your color x2)");
         return interaction.editReply({
           embeds: [
             new EmbedBuilder()
               .setColor(0xf39c12)
-              .setTitle("🎲 DICE — Duplicate! Reroll")
+              .setTitle("🎲 DICE — Your color x2! Reroll")
               .setDescription(
                 mention +
                   "\n\n" +
@@ -1893,7 +2089,7 @@ client.on("interactionCreate", async (interaction) => {
                     pick,
                     rolledEmojis,
                     false,
-                    "⚠️ **A color appeared 2 times!**\nFree **reroll** — pick a **different** color with `/dice`.\nIf the next roll has a double again → **you lose**."
+                    "⚠️ **Your color appeared 2 times!**\nFree **reroll** — pick a **different** color with `/dice`.\nIf your new color appears 2× again → **you lose**."
                   )
               )
               .setFooter({ text: "Free reroll • pick another color" })
@@ -3518,6 +3714,392 @@ client.on("interactionCreate", async (interaction) => {
             .setDescription("Removed **" + count + "** key(s) from the database."),
         ],
       });
+    }
+
+    // ─── NEW FEATURES ─────────────────────────────────────
+    if (cmd === "stats") {
+      const now = Math.floor(Date.now() / 1000);
+      const keys = Object.values(data.keys || {});
+      const unused = keys.filter((k) => !k.used).length;
+      const used = keys.filter((k) => k.used).length;
+      const activeWl = Object.values(data.whitelist || {}).filter((e) => e > now).length;
+      const life = Object.keys(data.lifetimeWhitelist || {}).length;
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x00e5ff)
+            .setTitle("📊 LARP TP Stats")
+            .addFields(
+              { name: "🔑 Keys", value: "Unused **" + unused + "** · Used **" + used + "**", inline: true },
+              { name: "🟢 Access", value: "Timed **" + activeWl + "** · Life **" + life + "**", inline: true }
+            )
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    if (cmd === "status") {
+      data.discordToRoblox = data.discordToRoblox || {};
+      let uname = (interaction.options.getString("username") || "").toLowerCase();
+      if (!uname) uname = data.discordToRoblox[interaction.user.id] || "";
+      if (!uname) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("👤 No account")
+              .setDescription("Provide a username or redeem a key first."),
+          ],
+        });
+      }
+      const now = Math.floor(Date.now() / 1000);
+      let status = "❌ No active access";
+      let color = 0x95a5a6;
+      if (data.lifetimeWhitelist && data.lifetimeWhitelist[uname]) {
+        status = "♾️ **LIFETIME**";
+        color = 0x9b59b6;
+      } else if (data.whitelist[uname] && data.whitelist[uname] > now) {
+        status = "🟢 **" + Math.floor((data.whitelist[uname] - now) / 60) + " min left**";
+        color = 0x2ecc71;
+      }
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(color)
+            .setTitle("👤 Status")
+            .setDescription("**" + uname + "**\n" + status)
+            .setTimestamp(),
+        ],
+      });
+    }
+
+    if (cmd === "statuspanel") {
+      try { await interaction.deleteReply().catch(() => {}); } catch (_) {}
+      await interaction.channel.send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x00e5ff)
+            .setTitle("👤 My Status — LARP TP")
+            .setDescription("Click **My Status** to see your access time.")
+            .setTimestamp(),
+        ],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId("status_check")
+              .setLabel("My Status")
+              .setEmoji("👤")
+              .setStyle(ButtonStyle.Primary)
+          ),
+        ],
+      });
+      try { await interaction.followUp({ content: "✅ Panel posted.", ephemeral: true }); } catch (_) {}
+      return;
+    }
+
+    if (cmd === "backup") {
+      const json = JSON.stringify(data, null, 2);
+      try {
+        await interaction.user.send({
+          content: "💾 Backup " + new Date().toISOString(),
+          files: [{ attachment: Buffer.from(json, "utf8"), name: "larp-backup.json" }],
+        });
+        return interaction.editReply({
+          embeds: [new EmbedBuilder().setColor(0x2ecc71).setTitle("💾 Backup sent in DMs")],
+        });
+      } catch {
+        return interaction.editReply({
+          embeds: [new EmbedBuilder().setColor(0xe74c3c).setTitle("❌ Open your DMs")],
+        });
+      }
+    }
+
+    if (cmd === "coinflip") {
+      const win = Math.random() < 0.5;
+      if (win) {
+        data.spinsBonus[interaction.user.id] = (data.spinsBonus[interaction.user.id] || 0) + 1;
+        delete data.spins[interaction.user.id];
+        saveData(data);
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x2ecc71)
+              .setTitle("🪙 Heads — You win!")
+              .setDescription("🎁 **+1 bonus spin**"),
+          ],
+        });
+      }
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder().setColor(0x95a5a6).setTitle("🪙 Tails — No luck").setDescription("Try later."),
+        ],
+      });
+    }
+
+    if (cmd === "quest") {
+      const uid = interaction.user.id;
+      const today = dayKey();
+      data.quests = data.quests || {};
+      if (!data.quests[uid] || data.quests[uid].day !== today) {
+        data.quests[uid] = { day: today, spin: false, dice: false, claimed: false };
+        saveData(data);
+      }
+      const q = data.quests[uid];
+      if (q.claimed) {
+        return interaction.editReply({
+          embeds: [new EmbedBuilder().setColor(0xf39c12).setTitle("📜 Already claimed today")],
+        });
+      }
+      if (!(q.spin && q.dice)) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x3498db)
+              .setTitle("📜 Daily Quest")
+              .setDescription(
+                (q.spin ? "✅" : "⬜") +
+                  " `/spin`\n" +
+                  (q.dice ? "✅" : "⬜") +
+                  " `/dice`\n\nReward: **+1 spin**"
+              ),
+          ],
+        });
+      }
+      q.claimed = true;
+      data.spinsBonus[uid] = (data.spinsBonus[uid] || 0) + 1;
+      delete data.spins[uid];
+      saveData(data);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder().setColor(0x2ecc71).setTitle("📜 Quest complete!").setDescription("✅ **+1 bonus spin**"),
+        ],
+      });
+    }
+
+    if (cmd === "warn") {
+      const user = interaction.options.getUser("user");
+      const reason = interaction.options.getString("reason");
+      data.warns = data.warns || {};
+      data.warns[user.id] = data.warns[user.id] || [];
+      data.warns[user.id].push({ reason, by: interaction.user.tag, at: new Date().toISOString() });
+      saveData(data);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xf39c12)
+            .setTitle("⚠️ Warned")
+            .setDescription("**" + user.tag + "** — " + reason + "\nTotal: **" + data.warns[user.id].length + "**"),
+        ],
+      });
+    }
+
+    if (cmd === "warns") {
+      const user = interaction.options.getUser("user");
+      const list = (data.warns && data.warns[user.id]) || [];
+      if (!list.length) {
+        return interaction.editReply({
+          embeds: [new EmbedBuilder().setColor(0x2ecc71).setTitle("📋 No warns for " + user.tag)],
+        });
+      }
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xf39c12)
+            .setTitle("📋 Warns — " + user.tag)
+            .setDescription(
+              list
+                .slice(-10)
+                .map((w, i) => i + 1 + ". " + w.reason + " — _" + w.by + "_")
+                .join("\n")
+            ),
+        ],
+      });
+    }
+
+    if (cmd === "clearwarns") {
+      const user = interaction.options.getUser("user");
+      data.warns = data.warns || {};
+      const n = (data.warns[user.id] || []).length;
+      data.warns[user.id] = [];
+      saveData(data);
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("🧹 Cleared")
+            .setDescription("Removed **" + n + "** warn(s) from **" + user.tag + "**"),
+        ],
+      });
+    }
+
+    if (cmd === "poll") {
+      const question = interaction.options.getString("question");
+      const options = [
+        interaction.options.getString("option1"),
+        interaction.options.getString("option2"),
+        interaction.options.getString("option3"),
+        interaction.options.getString("option4"),
+      ].filter(Boolean);
+      try { await interaction.deleteReply().catch(() => {}); } catch (_) {}
+      const row = new ActionRowBuilder();
+      options.forEach((o, i) => {
+        row.addComponents(
+          new ButtonBuilder()
+            .setCustomId("poll_" + i)
+            .setLabel(i + 1 + ". " + o.slice(0, 70))
+            .setStyle(ButtonStyle.Secondary)
+        );
+      });
+      const msg = await interaction.channel.send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x3498db)
+            .setTitle("📊 " + question)
+            .setDescription(options.map((o, i) => i + 1 + ". **" + o + "** — 0").join("\n"))
+            .setTimestamp(),
+        ],
+        components: [row],
+      });
+      activePolls.set(msg.id, { question, options, votes: {} });
+      try { await interaction.followUp({ content: "✅ Poll posted.", ephemeral: true }); } catch (_) {}
+      return;
+    }
+
+    if (cmd === "ticket" || cmd === "ticketpanel") {
+      if (cmd === "ticketpanel") {
+        try { await interaction.deleteReply().catch(() => {}); } catch (_) {}
+        await interaction.channel.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x3498db)
+              .setTitle("🎫 Support")
+              .setDescription("Need help? Click below to open a private ticket.")
+              .setTimestamp(),
+          ],
+          components: [
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder()
+                .setCustomId("ticket_open")
+                .setLabel("Open ticket")
+                .setEmoji("🎫")
+                .setStyle(ButtonStyle.Primary)
+            ),
+          ],
+        });
+        try { await interaction.followUp({ content: "✅ Ticket panel posted.", ephemeral: true }); } catch (_) {}
+        return;
+      }
+      // /ticket
+      const guild = interaction.guild;
+      if (!guild) return interaction.editReply({ content: "Guild only." });
+      try {
+        const overwrites = [
+          { id: guild.id, deny: ["ViewChannel"] },
+          {
+            id: interaction.user.id,
+            allow: ["ViewChannel", "SendMessages", "ReadMessageHistory", "AttachFiles"],
+          },
+          { id: client.user.id, allow: ["ViewChannel", "SendMessages", "ManageChannels"] },
+        ];
+        for (const adminId of BOT_ADMINS) {
+          overwrites.push({
+            id: adminId,
+            allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"],
+          });
+        }
+        const ch = await guild.channels.create({
+          name: "ticket-" + interaction.user.username.toLowerCase().slice(0, 20),
+          type: 0,
+          parent: TICKET_CATEGORY_ID || undefined,
+          permissionOverwrites: overwrites,
+        });
+        await ch.send({
+          content: "<@" + interaction.user.id + ">",
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x3498db)
+              .setTitle("🎫 Support ticket")
+              .setDescription("Describe your issue. Close with `/closeticket`.")
+              .setTimestamp(),
+          ],
+        });
+        return interaction.editReply({ content: "✅ Ticket: <#" + ch.id + ">" });
+      } catch (e) {
+        return interaction.editReply({ content: "❌ `" + e.message + "`" });
+      }
+    }
+
+    if (cmd === "closeticket") {
+      const ch = interaction.channel;
+      if (!ch || !ch.name || !String(ch.name).startsWith("ticket-")) {
+        return interaction.editReply({
+          embeds: [new EmbedBuilder().setColor(0xe74c3c).setTitle("❌ Not a ticket channel")],
+        });
+      }
+      await interaction.editReply({ content: "🔒 Closing in 3s…" });
+      setTimeout(() => ch.delete().catch(() => {}), 3000);
+      return;
+    }
+
+    if (cmd === "welcome") {
+      const custom = interaction.options.getString("text");
+      try { await interaction.deleteReply().catch(() => {}); } catch (_) {}
+      await interaction.channel.send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x9b59b6)
+            .setTitle("👋 Welcome to LARP TP")
+            .setDescription(
+              custom ||
+                "• `/redeem` — activate a key\n• `/spin` / `/dice` — daily games\n• `/ticket` — need help?"
+            )
+            .setTimestamp(),
+        ],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId("rules_ack")
+              .setLabel("I have read the rules")
+              .setEmoji("✅")
+              .setStyle(ButtonStyle.Success)
+          ),
+        ],
+      });
+      try { await interaction.followUp({ content: "✅ Posted.", ephemeral: true }); } catch (_) {}
+      return;
+    }
+
+    if (cmd === "duel") {
+      const opponent = interaction.options.getUser("opponent");
+      if (opponent.id === interaction.user.id || opponent.bot) {
+        return interaction.editReply({
+          embeds: [new EmbedBuilder().setColor(0xe74c3c).setTitle("❌ Invalid opponent")],
+        });
+      }
+      try { await interaction.deleteReply().catch(() => {}); } catch (_) {}
+      await interaction.channel.send({
+        content: "<@" + opponent.id + ">",
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xe67e22)
+            .setTitle("⚔️ Spin duel!")
+            .setDescription(
+              "<@" + interaction.user.id + "> challenges <@" + opponent.id + ">!\nClick **Accept**."
+            )
+            .setTimestamp(),
+        ],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId("duel_accept_" + interaction.user.id)
+              .setLabel("Accept")
+              .setEmoji("⚔️")
+              .setStyle(ButtonStyle.Danger)
+          ),
+        ],
+      });
+      try { await interaction.followUp({ content: "✅ Challenge sent.", ephemeral: true }); } catch (_) {}
+      return;
     }
 
     return interaction.editReply({
