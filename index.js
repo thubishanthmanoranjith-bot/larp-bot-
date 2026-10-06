@@ -1183,6 +1183,174 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
+    // Status / ticket / poll / duel / rules (must run BEFORE inv_ filter)
+    if (
+      id === "status_check" ||
+      id === "ticket_open" ||
+      id === "rules_ack" ||
+      id.startsWith("poll_") ||
+      id.startsWith("duel_accept_")
+    ) {
+      try {
+        await interaction.deferReply({ ephemeral: true });
+      } catch {
+        return;
+      }
+
+      if (id === "rules_ack") {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x2ecc71)
+              .setTitle("✅ Thanks!")
+              .setDescription("You're all set. Have fun!"),
+          ],
+        });
+      }
+
+      if (id === "status_check") {
+        const data = loadData();
+        data.discordToRoblox = data.discordToRoblox || {};
+        const uname = data.discordToRoblox[interaction.user.id];
+        if (!uname) {
+          return interaction.editReply({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(0xf39c12)
+                .setTitle("👤 No linked account")
+                .setDescription("Redeem a key with `/redeem` first."),
+            ],
+          });
+        }
+        const now = Math.floor(Date.now() / 1000);
+        let status = "❌ No active access";
+        let color = 0x95a5a6;
+        if (data.lifetimeWhitelist && data.lifetimeWhitelist[uname]) {
+          status = "♾️ **LIFETIME**";
+          color = 0x9b59b6;
+        } else if (data.whitelist[uname] && data.whitelist[uname] > now) {
+          status =
+            "🟢 **WHITELIST** — " +
+            Math.floor((data.whitelist[uname] - now) / 60) +
+            " min left";
+          color = 0x2ecc71;
+        }
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(color)
+              .setTitle("👤 Your status")
+              .setDescription("Roblox: **" + uname + "**\n" + status)
+              .setTimestamp(),
+          ],
+        });
+      }
+
+      if (id === "ticket_open") {
+        const guild = interaction.guild;
+        if (!guild) return interaction.editReply({ content: "Guild only." });
+        try {
+          const overwrites = [
+            { id: guild.id, deny: ["ViewChannel"] },
+            {
+              id: interaction.user.id,
+              allow: ["ViewChannel", "SendMessages", "ReadMessageHistory", "AttachFiles"],
+            },
+            {
+              id: client.user.id,
+              allow: ["ViewChannel", "SendMessages", "ManageChannels"],
+            },
+          ];
+          for (const adminId of BOT_ADMINS) {
+            overwrites.push({
+              id: adminId,
+              allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"],
+            });
+          }
+          const ch = await guild.channels.create({
+            name: "ticket-" + interaction.user.username.toLowerCase().slice(0, 20),
+            type: 0,
+            parent: TICKET_CATEGORY_ID || undefined,
+            permissionOverwrites: overwrites,
+          });
+          await ch.send({
+            content: "<@" + interaction.user.id + ">",
+            embeds: [
+              new EmbedBuilder()
+                .setColor(0x3498db)
+                .setTitle("🎫 Support ticket")
+                .setDescription("Describe your issue. Close with `/closeticket`.")
+                .setTimestamp(),
+            ],
+          });
+          return interaction.editReply({ content: "✅ Ticket created: <#" + ch.id + ">" });
+        } catch (e) {
+          return interaction.editReply({
+            content: "❌ Could not create ticket: `" + e.message + "`\nCheck bot permissions (Manage Channels).",
+          });
+        }
+      }
+
+      if (id.startsWith("poll_")) {
+        const opt = parseInt(id.split("_")[1], 10);
+        const poll = activePolls.get(interaction.message.id);
+        if (!poll) return interaction.editReply({ content: "Poll closed." });
+        for (const set of Object.values(poll.votes)) set.delete(interaction.user.id);
+        if (!poll.votes[opt]) poll.votes[opt] = new Set();
+        poll.votes[opt].add(interaction.user.id);
+        const lines = poll.options.map(
+          (o, i) =>
+            i +
+            1 +
+            ". **" +
+            o +
+            "** — " +
+            ((poll.votes[i] && poll.votes[i].size) || 0) +
+            " vote(s)"
+        );
+        try {
+          await interaction.message.edit({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(0x3498db)
+                .setTitle("📊 " + poll.question)
+                .setDescription(lines.join("\n"))
+                .setFooter({ text: "Click to vote" })
+                .setTimestamp(),
+            ],
+          });
+        } catch (_) {}
+        return interaction.editReply({ content: "✅ Vote recorded." });
+      }
+
+      if (id.startsWith("duel_accept_")) {
+        const challengerId = id.replace("duel_accept_", "");
+        if (interaction.user.id === challengerId)
+          return interaction.editReply({ content: "Can't accept your own duel." });
+        const a = Math.floor(Math.random() * 100) + 1;
+        const b = Math.floor(Math.random() * 100) + 1;
+        let result;
+        if (a > b)
+          result = "<@" + challengerId + "> wins (**" + a + "** vs **" + b + "**)!";
+        else if (b > a)
+          result = "<@" + interaction.user.id + "> wins (**" + b + "** vs **" + a + "**)!";
+        else result = "Tie! (**" + a + "** vs **" + b + "**)";
+        try {
+          await interaction.message.edit({
+            components: [],
+            embeds: [
+              new EmbedBuilder()
+                .setColor(0xe67e22)
+                .setTitle("⚔️ Duel result")
+                .setDescription(result)
+                .setTimestamp(),
+            ],
+          });
+        } catch (_) {}
+        return interaction.editReply({ content: "⚔️ " + result });
+      }
+    }
+
     if (!id.startsWith("inv_")) return;
 
     try {
