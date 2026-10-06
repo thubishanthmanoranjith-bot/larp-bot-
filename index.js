@@ -19,7 +19,13 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  PermissionFlagsBits,
+  ChannelType,
 } = require("discord.js");
+
+function isSnowflake(id) {
+  return typeof id === "string" && /^\d{17,20}$/.test(String(id));
+}
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -37,6 +43,66 @@ const BOT_ADMINS = (process.env.BOT_ADMINS || "")
 const WHITELIST_ROLE_ID = process.env.WHITELIST_ROLE_ID || "";
 const TICKET_CATEGORY_ID = process.env.TICKET_CATEGORY_ID || "";
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID || "";
+
+function buildTicketOverwrites(guild, userId, botId) {
+  const overwrites = [
+    {
+      id: guild.roles.everyone.id,
+      deny: [PermissionFlagsBits.ViewChannel],
+    },
+    {
+      id: userId,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.AttachFiles,
+      ],
+    },
+  ];
+  if (botId && isSnowflake(String(botId))) {
+    overwrites.push({
+      id: String(botId),
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ManageChannels,
+        PermissionFlagsBits.ReadMessageHistory,
+      ],
+    });
+  }
+  for (const adminId of BOT_ADMINS) {
+    if (!isSnowflake(String(adminId))) continue;
+    if (String(adminId) === String(userId)) continue;
+    overwrites.push({
+      id: String(adminId),
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+      ],
+    });
+  }
+  return overwrites;
+}
+
+async function createTicketChannel(guild, user, botId) {
+  const safe =
+    String(user.username || "user")
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "")
+      .slice(0, 20) || user.id.slice(-6);
+  const opts = {
+    name: "ticket-" + safe,
+    type: ChannelType.GuildText,
+    permissionOverwrites: buildTicketOverwrites(guild, user.id, botId),
+    reason: "LARP TP support ticket",
+  };
+  if (TICKET_CATEGORY_ID && isSnowflake(String(TICKET_CATEGORY_ID))) {
+    opts.parent = String(TICKET_CATEGORY_ID);
+  }
+  return guild.channels.create(opts);
+}
 
 // Do NOT use /tmp by default — wiped on redeploy
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
@@ -1250,29 +1316,11 @@ client.on("interactionCreate", async (interaction) => {
         const guild = interaction.guild;
         if (!guild) return interaction.editReply({ content: "Guild only." });
         try {
-          const overwrites = [
-            { id: guild.id, deny: ["ViewChannel"] },
-            {
-              id: interaction.user.id,
-              allow: ["ViewChannel", "SendMessages", "ReadMessageHistory", "AttachFiles"],
-            },
-            {
-              id: client.user.id,
-              allow: ["ViewChannel", "SendMessages", "ManageChannels"],
-            },
-          ];
-          for (const adminId of BOT_ADMINS) {
-            overwrites.push({
-              id: adminId,
-              allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"],
-            });
-          }
-          const ch = await guild.channels.create({
-            name: "ticket-" + interaction.user.username.toLowerCase().slice(0, 20),
-            type: 0,
-            parent: TICKET_CATEGORY_ID || undefined,
-            permissionOverwrites: overwrites,
-          });
+          const ch = await createTicketChannel(
+            guild,
+            interaction.user,
+            client.user.id
+          );
           await ch.send({
             content: "<@" + interaction.user.id + ">",
             embeds: [
@@ -1286,7 +1334,10 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.editReply({ content: "✅ Ticket created: <#" + ch.id + ">" });
         } catch (e) {
           return interaction.editReply({
-            content: "❌ Could not create ticket: `" + e.message + "`\nCheck bot permissions (Manage Channels).",
+            content:
+              "❌ Could not create ticket: `" +
+              e.message +
+              "`\nCheck bot role is high enough + **Manage Channels**.",
           });
         }
       }
@@ -1524,26 +1575,7 @@ client.on("interactionCreate", async (interaction) => {
       const guild = interaction.guild;
       if (!guild) return interaction.editReply({ content: "Guild only." });
       try {
-        const overwrites = [
-          { id: guild.id, deny: ["ViewChannel"] },
-          {
-            id: interaction.user.id,
-            allow: ["ViewChannel", "SendMessages", "ReadMessageHistory", "AttachFiles"],
-          },
-          { id: client.user.id, allow: ["ViewChannel", "SendMessages", "ManageChannels"] },
-        ];
-        for (const adminId of BOT_ADMINS) {
-          overwrites.push({
-            id: adminId,
-            allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"],
-          });
-        }
-        const ch = await guild.channels.create({
-          name: "ticket-" + interaction.user.username.toLowerCase().slice(0, 20),
-          type: 0,
-          parent: TICKET_CATEGORY_ID || undefined,
-          permissionOverwrites: overwrites,
-        });
+        const ch = await createTicketChannel(guild, interaction.user, client.user.id);
         await ch.send({
           content: "<@" + interaction.user.id + ">",
           embeds: [
@@ -1556,7 +1588,9 @@ client.on("interactionCreate", async (interaction) => {
         });
         return interaction.editReply({ content: "✅ Ticket: <#" + ch.id + ">" });
       } catch (e) {
-        return interaction.editReply({ content: "❌ `" + e.message + "`" });
+        return interaction.editReply({
+          content: "❌ `" + e.message + "` — need Manage Channels + role above the channel.",
+        });
       }
     }
 
@@ -4161,26 +4195,7 @@ client.on("interactionCreate", async (interaction) => {
       const guild = interaction.guild;
       if (!guild) return interaction.editReply({ content: "Guild only." });
       try {
-        const overwrites = [
-          { id: guild.id, deny: ["ViewChannel"] },
-          {
-            id: interaction.user.id,
-            allow: ["ViewChannel", "SendMessages", "ReadMessageHistory", "AttachFiles"],
-          },
-          { id: client.user.id, allow: ["ViewChannel", "SendMessages", "ManageChannels"] },
-        ];
-        for (const adminId of BOT_ADMINS) {
-          overwrites.push({
-            id: adminId,
-            allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"],
-          });
-        }
-        const ch = await guild.channels.create({
-          name: "ticket-" + interaction.user.username.toLowerCase().slice(0, 20),
-          type: 0,
-          parent: TICKET_CATEGORY_ID || undefined,
-          permissionOverwrites: overwrites,
-        });
+        const ch = await createTicketChannel(guild, interaction.user, client.user.id);
         await ch.send({
           content: "<@" + interaction.user.id + ">",
           embeds: [
@@ -4193,7 +4208,9 @@ client.on("interactionCreate", async (interaction) => {
         });
         return interaction.editReply({ content: "✅ Ticket: <#" + ch.id + ">" });
       } catch (e) {
-        return interaction.editReply({ content: "❌ `" + e.message + "`" });
+        return interaction.editReply({
+          content: "❌ `" + e.message + "` — need Manage Channels + role above the channel.",
+        });
       }
     }
 
