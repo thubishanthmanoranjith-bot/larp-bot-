@@ -44,18 +44,26 @@ const WHITELIST_ROLE_ID = process.env.WHITELIST_ROLE_ID || "";
 const TICKET_CATEGORY_ID = process.env.TICKET_CATEGORY_ID || "";
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID || "";
 
-async function createTicketChannel(guild, user, botId) {
+const TICKET_TYPES = {
+  buy: { label: "Buy", emoji: "💰", color: 0x2ecc71, title: "💰 Purchase" },
+  help: { label: "Help", emoji: "❓", color: 0x3498db, title: "❓ Help" },
+  key: { label: "Key issue", emoji: "🔑", color: 0xf1c40f, title: "🔑 Key issue" },
+  bug: { label: "Bug", emoji: "🐛", color: 0xe74c3c, title: "🐛 Bug report" },
+};
+
+async function createTicketChannel(guild, user, botId, typeKey) {
+  const type = TICKET_TYPES[typeKey] || TICKET_TYPES.help;
   const safe =
     String(user.username || "user")
       .toLowerCase()
       .replace(/[^a-z0-9]/g, "")
-      .slice(0, 20) || String(user.id).slice(-6);
+      .slice(0, 16) || String(user.id).slice(-6);
 
   // Create with NO permissionOverwrites first (fixes "not a cached User or Role")
   const opts = {
-    name: "ticket-" + safe,
+    name: typeKey + "-" + safe,
     type: ChannelType.GuildText,
-    reason: "LARP TP support ticket v3",
+    reason: "LARP TP ticket: " + type.label,
   };
 
   const ch = await guild.channels.create(opts);
@@ -1258,6 +1266,7 @@ client.on("interactionCreate", async (interaction) => {
     if (
       id === "status_check" ||
       id === "ticket_open" ||
+      id.startsWith("ticket_open_") ||
       id === "rules_ack" ||
       id.startsWith("poll_") ||
       id.startsWith("duel_accept_")
@@ -1317,26 +1326,38 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      if (id === "ticket_open") {
+      if (id === "ticket_open" || id.startsWith("ticket_open_")) {
         const guild = interaction.guild;
         if (!guild) return interaction.editReply({ content: "Guild only." });
+        const typeKey =
+          id === "ticket_open" ? "help" : id.replace("ticket_open_", "") || "help";
+        const type = TICKET_TYPES[typeKey] || TICKET_TYPES.help;
         try {
           const ch = await createTicketChannel(
             guild,
             interaction.user,
-            client.user.id
+            client.user.id,
+            typeKey
           );
           await ch.send({
             content: "<@" + interaction.user.id + ">",
             embeds: [
               new EmbedBuilder()
-                .setColor(0x3498db)
-                .setTitle("🎫 Support ticket")
-                .setDescription("Describe your issue. Close with `/closeticket`.")
+                .setColor(type.color)
+                .setTitle(type.emoji + " " + type.title)
+                .setDescription(
+                  "Category: **" +
+                    type.label +
+                    "**\nUser: <@" +
+                    interaction.user.id +
+                    ">\n\nDescribe your request below.\nStaff: close with `/closeticket`."
+                )
                 .setTimestamp(),
             ],
           });
-          return interaction.editReply({ content: "✅ Ticket created: <#" + ch.id + ">" });
+          return interaction.editReply({
+            content: "✅ " + type.emoji + " Ticket created: <#" + ch.id + ">",
+          });
         } catch (e) {
           return interaction.editReply({
             content:
@@ -1576,28 +1597,7 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    if (id === "ticket_open") {
-      const guild = interaction.guild;
-      if (!guild) return interaction.editReply({ content: "Guild only." });
-      try {
-        const ch = await createTicketChannel(guild, interaction.user, client.user.id);
-        await ch.send({
-          content: "<@" + interaction.user.id + ">",
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0x3498db)
-              .setTitle("🎫 Support ticket")
-              .setDescription("Describe your issue. Close with `/closeticket`.")
-              .setTimestamp(),
-          ],
-        });
-        return interaction.editReply({ content: "✅ Ticket: <#" + ch.id + ">" });
-      } catch (e) {
-        return interaction.editReply({
-          content: "❌ `" + e.message + "` — need Manage Channels + role above the channel.",
-        });
-      }
-    }
+    // ticket handled earlier (before inv_ filter)
 
     if (id.startsWith("poll_")) {
       const opt = parseInt(id.split("_")[1], 10);
@@ -4178,35 +4178,63 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.channel.send({
           embeds: [
             new EmbedBuilder()
-              .setColor(0x3498db)
-              .setTitle("🎫 Support")
-              .setDescription("Need help? Click below to open a private ticket.")
+              .setColor(0x9b59b6)
+              .setTitle("🎫 Need help?")
+              .setDescription(
+                "Click a button below to open a **private ticket**.\n" +
+                  "Our staff will get back to you shortly.\n\n" +
+                  "💰 **Buy** — purchase / payment\n" +
+                  "❓ **Help** — general support\n" +
+                  "🔑 **Key issue** — redeem / key problems\n" +
+                  "🐛 **Bug** — report a bug"
+              )
+              .setFooter({ text: "LARP TP • Support" })
               .setTimestamp(),
           ],
           components: [
             new ActionRowBuilder().addComponents(
               new ButtonBuilder()
-                .setCustomId("ticket_open")
-                .setLabel("Open ticket")
-                .setEmoji("🎫")
-                .setStyle(ButtonStyle.Primary)
+                .setCustomId("ticket_open_buy")
+                .setLabel("Buy")
+                .setEmoji("💰")
+                .setStyle(ButtonStyle.Success),
+              new ButtonBuilder()
+                .setCustomId("ticket_open_help")
+                .setLabel("Help")
+                .setEmoji("❓")
+                .setStyle(ButtonStyle.Primary),
+              new ButtonBuilder()
+                .setCustomId("ticket_open_key")
+                .setLabel("Key issue")
+                .setEmoji("🔑")
+                .setStyle(ButtonStyle.Secondary),
+              new ButtonBuilder()
+                .setCustomId("ticket_open_bug")
+                .setLabel("Bug")
+                .setEmoji("🐛")
+                .setStyle(ButtonStyle.Danger)
             ),
           ],
         });
         try { await interaction.followUp({ content: "✅ Ticket panel posted.", ephemeral: true }); } catch (_) {}
         return;
       }
-      // /ticket
+      // /ticket → general help
       const guild = interaction.guild;
       if (!guild) return interaction.editReply({ content: "Guild only." });
       try {
-        const ch = await createTicketChannel(guild, interaction.user, client.user.id);
+        const ch = await createTicketChannel(
+          guild,
+          interaction.user,
+          client.user.id,
+          "help"
+        );
         await ch.send({
           content: "<@" + interaction.user.id + ">",
           embeds: [
             new EmbedBuilder()
               .setColor(0x3498db)
-              .setTitle("🎫 Support ticket")
+              .setTitle("❓ Help")
               .setDescription("Describe your issue. Close with `/closeticket`.")
               .setTimestamp(),
           ],
@@ -4214,14 +4242,24 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply({ content: "✅ Ticket: <#" + ch.id + ">" });
       } catch (e) {
         return interaction.editReply({
-          content: "❌ `" + e.message + "` — need Manage Channels + role above the channel.",
+          content: "❌ Ticket error (v3): `" + e.message + "`",
         });
       }
     }
 
     if (cmd === "closeticket") {
       const ch = interaction.channel;
-      if (!ch || !ch.name || !String(ch.name).startsWith("ticket-")) {
+      if (
+        !ch ||
+        !ch.name ||
+        !(
+          String(ch.name).startsWith("ticket-") ||
+          String(ch.name).startsWith("buy-") ||
+          String(ch.name).startsWith("help-") ||
+          String(ch.name).startsWith("key-") ||
+          String(ch.name).startsWith("bug-")
+        )
+      ) {
         return interaction.editReply({
           embeds: [new EmbedBuilder().setColor(0xe74c3c).setTitle("❌ Not a ticket channel")],
         });
