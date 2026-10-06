@@ -35,9 +35,15 @@ const BOT_ADMINS = (process.env.BOT_ADMINS || "")
   .map((id) => id.trim())
   .filter(Boolean);
 
-const DATA_DIR = process.env.DATA_DIR || "/tmp";
+// Do NOT use /tmp by default — wiped on redeploy
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const DATA_FILE = path.join(DATA_DIR, "larp-data.json");
 const LOCAL_FALLBACK = path.join(__dirname, "data.json");
+try {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+} catch (e) {
+  console.warn("[DATA] mkdir", e.message);
+}
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -65,6 +71,7 @@ const guessGames = new Map();
 // Raffle: guildId → { prize, entrants: Set, messageId, active }
 const activeRaffles = new Map();
 const activeGiveaways = new Map();
+const lastGiveaways = new Map(); // guildId -> last ended giveaway for /reroll
 
 async function lockGuessChannel(channel, reason) {
   if (!channel || !channel.permissionOverwrites) return;
@@ -156,17 +163,17 @@ function dayKey() {
 }
 
 function saveData(data) {
+  const json = JSON.stringify(data, null, 2);
   try {
-    // logs illimites (pas de slice)
-
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(DATA_FILE, json);
   } catch (e) {
-    console.warn("saveData failed", e.message);
-    try {
-      fs.writeFileSync(LOCAL_FALLBACK, JSON.stringify(data, null, 2));
-    } catch (e2) {
-      console.warn("saveData fallback failed", e2.message);
-    }
+    console.warn("saveData primary failed", e.message);
+  }
+  try {
+    fs.writeFileSync(LOCAL_FALLBACK, json);
+  } catch (e2) {
+    console.warn("saveData fallback failed", e2.message);
   }
 }
 
@@ -204,6 +211,7 @@ function addLog(action, by, target, details) {
       giveaway: 0xf1c40f,
       giveaway_win: 0x2ecc71,
       giveaway_end: 0x95a5a6,
+      giveaway_reroll: 0xf1c40f,
     };
     const color = colors[action] || 0x95a5a6;
     const embed = {
@@ -402,7 +410,7 @@ function spinVisual(roll, win) {
   );
 }
 
-function diceVisual(pickEmoji, pick, rolledEmojis, match) {
+function diceVisual(pickEmoji, pick, rolledEmojis, match, extra) {
   const line = rolledEmojis.join("  ");
   return (
     "```\n" +
@@ -421,10 +429,21 @@ function diceVisual(pickEmoji, pick, rolledEmojis, match) {
     "The 4 colors: " +
     line +
     "\n\n" +
-    (match
-      ? "🎉🎊 **YOUR COLOR APPEARED!** You win a **1h** key 🔑"
-      : "💔 Your color did not appear... try again tomorrow!")
+    (extra
+      ? extra
+      : match
+        ? "🎉🎊 **YOUR COLOR APPEARED!** You win a **1h** key 🔑"
+        : "💔 Your color did not appear... try again tomorrow!")
   );
+}
+
+function diceHasDuplicate(rolled) {
+  const counts = {};
+  for (const c of rolled) {
+    counts[c.value] = (counts[c.value] || 0) + 1;
+    if (counts[c.value] >= 2) return true;
+  }
+  return false;
 }
 
 function buildInvitePanelEmbed() {
@@ -768,6 +787,12 @@ const commands = [
   new SlashCommandBuilder()
     .setName("giveawayend")
     .setDescription("🎁 End giveaway early and draw (admin)"),
+  new SlashCommandBuilder()
+    .setName("reroll")
+    .setDescription("🎲 Reroll last giveaway winners (admin)")
+    .addIntegerOption((o) =>
+      o.setName("winners").setDescription("Number of winners (default: same as last)").setMinValue(1).setMaxValue(20)
+    ),
 ].map((c) => c.toJSON());
 
 const client = new Client({
@@ -1759,8 +1784,10 @@ client.on("interactionCreate", async (interaction) => {
       const last = data.dice[uid] || 0;
       const bonus = getBonus(data, "dice", uid);
       const onCooldown = now - last < DAY_MS;
+      data.diceReroll = data.diceReroll || {};
+      const pendingReroll = data.diceReroll[uid] || null;
 
-      if (onCooldown && bonus <= 0) {
+      if (!pendingReroll && onCooldown && bonus <= 0) {
         const left = DAY_MS - (now - last);
         return interaction.editReply({
           embeds: [
@@ -1779,13 +1806,30 @@ client.on("interactionCreate", async (interaction) => {
       const pick = interaction.options.getString("color");
       const pickObj = DICE_COLORS.find((c) => c.value === pick) || DICE_COLORS[0];
 
+      if (pendingReroll && pendingReroll.previousPick === pick) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("🎲 DICE — Reroll required")
+              .setDescription(
+                mention +
+                  " must pick a **different** color!\nYou already used **" +
+                  pendingReroll.previousPick +
+                  "**.\nChoose another with `/dice`."
+              )
+              .setTimestamp(),
+          ],
+        });
+      }
+
       for (let i = 0; i < 5; i++) {
         const flash = DICE_COLORS[i % DICE_COLORS.length];
         await interaction.editReply({
           embeds: [
             new EmbedBuilder()
               .setColor(0xf1c40f)
-              .setTitle("🎲 Dice Roll")
+              .setTitle(pendingReroll ? "🎲 Dice REROLL" : "🎲 Dice Roll")
               .setDescription(
                 mention + " is rolling...\n\n" + flash.emoji + " **" + flash.name + "**"
               ),
@@ -1794,16 +1838,72 @@ client.on("interactionCreate", async (interaction) => {
         await new Promise((r) => setTimeout(r, 280));
       }
 
-      if (onCooldown && bonus > 0) consumeBonus(data, "dice", uid);
-      else data.dice[uid] = now;
+      if (!pendingReroll) {
+        if (onCooldown && bonus > 0) consumeBonus(data, "dice", uid);
+        else data.dice[uid] = now;
+      }
 
       const rolled = [];
       for (let i = 0; i < 4; i++) {
         rolled.push(DICE_COLORS[Math.floor(Math.random() * DICE_COLORS.length)]);
       }
       const rolledEmojis = rolled.map((c) => c.emoji);
-      const match = rolled.some((c) => c.value === pick);
+      const hasDup = diceHasDuplicate(rolled);
       const remaining = getBonus(data, "dice", uid);
+
+      if (hasDup) {
+        if (pendingReroll) {
+          delete data.diceReroll[uid];
+          saveData(data);
+          addLog("dice_lose", interaction.user.tag, "", pick + " (double-duplicate)");
+          return interaction.editReply({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(0xe74c3c)
+                .setTitle("🎲 DICE — Loss (double duplicate)")
+                .setDescription(
+                  mention +
+                    " lost...\n\n" +
+                    diceVisual(
+                      pickObj.emoji,
+                      pick,
+                      rolledEmojis,
+                      false,
+                      "💥 **Same color 2× again** on the reroll — you lose!"
+                    )
+                )
+                .setFooter({ text: "Bonus left: " + remaining + " • 1 dice / day" })
+                .setTimestamp(),
+            ],
+          });
+        }
+        data.diceReroll[uid] = { previousPick: pick, at: now };
+        saveData(data);
+        addLog("dice_reroll", interaction.user.tag, "", pick + " (duplicate)");
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf39c12)
+              .setTitle("🎲 DICE — Duplicate! Reroll")
+              .setDescription(
+                mention +
+                  "\n\n" +
+                  diceVisual(
+                    pickObj.emoji,
+                    pick,
+                    rolledEmojis,
+                    false,
+                    "⚠️ **A color appeared 2 times!**\nFree **reroll** — pick a **different** color with `/dice`.\nIf the next roll has a double again → **you lose**."
+                  )
+              )
+              .setFooter({ text: "Free reroll • pick another color" })
+              .setTimestamp(),
+          ],
+        });
+      }
+
+      delete data.diceReroll[uid];
+      const match = rolled.some((c) => c.value === pick);
 
       if (match) {
         const { key, data: kData } = makeKey1h("dice");
@@ -3157,6 +3257,13 @@ client.on("interactionCreate", async (interaction) => {
           }
           saveData(data);
         }
+        lastGiveaways.set(guildId, {
+          prize: g.prize,
+          winnersCount: g.winnersCount,
+          entrants: list,
+          previousWinners: winners,
+          channelId: g.channelId,
+        });
         addLog(
           "giveaway_win",
           winners.map((id) => "<@" + id + ">").join(", "),
@@ -3233,6 +3340,13 @@ client.on("interactionCreate", async (interaction) => {
       }
       const shuffled = list.sort(() => Math.random() - 0.5);
       const winners = shuffled.slice(0, Math.min(g.winnersCount, list.length));
+      lastGiveaways.set(guildId, {
+        prize: g.prize,
+        winnersCount: g.winnersCount,
+        entrants: list,
+        previousWinners: winners,
+        channelId: interaction.channelId,
+      });
       addLog(
         "giveaway_win",
         winners.map((id) => "<@" + id + ">").join(", "),
@@ -3264,6 +3378,80 @@ client.on("interactionCreate", async (interaction) => {
             .setColor(0x2ecc71)
             .setTitle("🎁 Drawn")
             .setDescription("Winners: " + winners.map((id) => "<@" + id + ">").join(", ")),
+        ],
+      });
+    }
+
+    if (cmd === "reroll") {
+      const guildId = interaction.guildId || "dm";
+      const last = lastGiveaways.get(guildId);
+      if (!last || !last.entrants || !last.entrants.length) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ Nothing to reroll")
+              .setDescription("No finished giveaway in this server yet."),
+          ],
+        });
+      }
+      const count =
+        interaction.options.getInteger("winners") || last.winnersCount || 1;
+      const pool = last.entrants.filter(
+        (id) => !(last.previousWinners || []).includes(id)
+      );
+      // If everyone already won, allow full pool again
+      const usePool = pool.length >= count ? pool : last.entrants.slice();
+      if (!usePool.length) {
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xe74c3c)
+              .setTitle("❌ No entrants")
+              .setDescription("Last giveaway had no participants."),
+          ],
+        });
+      }
+      const shuffled = usePool.sort(() => Math.random() - 0.5);
+      const winners = shuffled.slice(0, Math.min(count, usePool.length));
+      last.previousWinners = [
+        ...(last.previousWinners || []),
+        ...winners,
+      ];
+      lastGiveaways.set(guildId, last);
+      addLog(
+        "giveaway_reroll",
+        winners.map((id) => "<@" + id + ">").join(", "),
+        "",
+        last.prize
+      );
+      try {
+        await interaction.channel.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xf1c40f)
+              .setTitle("🎲 Giveaway REROLL!")
+              .setDescription(
+                "Prize: **" +
+                  last.prize +
+                  "**\nNew winner(s): " +
+                  winners.map((id) => "<@" + id + ">").join(", ") +
+                  "\nPool: **" +
+                  usePool.length +
+                  "** entrants"
+              )
+              .setTimestamp(),
+          ],
+        });
+      } catch (_) {}
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setTitle("🎲 Rerolled")
+            .setDescription(
+              "New winner(s): " + winners.map((id) => "<@" + id + ">").join(", ")
+            ),
         ],
       });
     }
