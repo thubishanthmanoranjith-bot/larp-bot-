@@ -44,64 +44,69 @@ const WHITELIST_ROLE_ID = process.env.WHITELIST_ROLE_ID || "";
 const TICKET_CATEGORY_ID = process.env.TICKET_CATEGORY_ID || "";
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID || "";
 
-function buildTicketOverwrites(guild, userId, botId) {
-  const overwrites = [
-    {
-      id: guild.roles.everyone.id,
-      deny: [PermissionFlagsBits.ViewChannel],
-    },
-    {
-      id: userId,
-      allow: [
-        PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.ReadMessageHistory,
-        PermissionFlagsBits.AttachFiles,
-      ],
-    },
-  ];
-  if (botId && isSnowflake(String(botId))) {
-    overwrites.push({
-      id: String(botId),
-      allow: [
-        PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.ManageChannels,
-        PermissionFlagsBits.ReadMessageHistory,
-      ],
-    });
-  }
-  for (const adminId of BOT_ADMINS) {
-    if (!isSnowflake(String(adminId))) continue;
-    if (String(adminId) === String(userId)) continue;
-    overwrites.push({
-      id: String(adminId),
-      allow: [
-        PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.ReadMessageHistory,
-      ],
-    });
-  }
-  return overwrites;
-}
-
 async function createTicketChannel(guild, user, botId) {
   const safe =
     String(user.username || "user")
       .toLowerCase()
       .replace(/[^a-z0-9]/g, "")
-      .slice(0, 20) || user.id.slice(-6);
+      .slice(0, 20) || String(user.id).slice(-6);
+
+  // Create with NO permissionOverwrites first (fixes "not a cached User or Role")
   const opts = {
     name: "ticket-" + safe,
     type: ChannelType.GuildText,
-    permissionOverwrites: buildTicketOverwrites(guild, user.id, botId),
-    reason: "LARP TP support ticket",
+    reason: "LARP TP support ticket v3",
   };
-  if (TICKET_CATEGORY_ID && isSnowflake(String(TICKET_CATEGORY_ID))) {
-    opts.parent = String(TICKET_CATEGORY_ID);
+
+  const ch = await guild.channels.create(opts);
+
+  // Permissions after create — use Role/User objects when possible
+  try {
+    await ch.permissionOverwrites.edit(guild.roles.everyone, { ViewChannel: false });
+  } catch (e) {
+    console.warn("[TICKET] everyone", e.message);
   }
-  return guild.channels.create(opts);
+  try {
+    const member = await guild.members.fetch(user.id).catch(() => null);
+    await ch.permissionOverwrites.edit(member || user.id, {
+      ViewChannel: true,
+      SendMessages: true,
+      ReadMessageHistory: true,
+      AttachFiles: true,
+    });
+  } catch (e) {
+    console.warn("[TICKET] user", e.message);
+  }
+  if (botId) {
+    try {
+      const botMember = await guild.members.fetch(String(botId)).catch(() => null);
+      await ch.permissionOverwrites.edit(botMember || String(botId), {
+        ViewChannel: true,
+        SendMessages: true,
+        ReadMessageHistory: true,
+        ManageChannels: true,
+      });
+    } catch (e) {
+      console.warn("[TICKET] bot", e.message);
+    }
+  }
+  for (const adminId of BOT_ADMINS) {
+    if (!isSnowflake(String(adminId))) continue;
+    if (String(adminId) === String(user.id)) continue;
+    try {
+      const m = await guild.members.fetch(String(adminId)).catch(() => null);
+      if (!m) continue;
+      await ch.permissionOverwrites.edit(m, {
+        ViewChannel: true,
+        SendMessages: true,
+        ReadMessageHistory: true,
+      });
+    } catch (e) {
+      console.warn("[TICKET] admin", adminId, e.message);
+    }
+  }
+
+  return ch;
 }
 
 // Do NOT use /tmp by default — wiped on redeploy
@@ -1335,9 +1340,9 @@ client.on("interactionCreate", async (interaction) => {
         } catch (e) {
           return interaction.editReply({
             content:
-              "❌ Could not create ticket: `" +
+              "❌ Ticket error (v3): `" +
               e.message +
-              "`\nCheck bot role is high enough + **Manage Channels**.",
+              "`\nBot needs **Manage Channels**. Role must be high in the list.",
           });
         }
       }
